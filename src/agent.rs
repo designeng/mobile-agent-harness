@@ -20,11 +20,20 @@ pub struct AgentSpec {
     pub json_schema: Option<Value>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct AgentResult {
     pub text: String,
     pub structured: Option<Value>,
     pub cost_usd: f64,
+    pub model: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub num_turns: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    /// Set when the session ended with `is_error`; cost and usage are still filled in.
+    pub error: Option<String>,
 }
 
 impl AgentSpec {
@@ -90,11 +99,13 @@ pub async fn run(spec: AgentSpec, log: &Path) -> Result<AgentResult> {
     let mut log_file = tokio::fs::File::create(log).await?;
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let mut result: Option<Value> = None;
+    let mut model: Option<String> = None;
     while let Some(line) = lines.next_line().await? {
         log_file.write_all(line.as_bytes()).await?;
         log_file.write_all(b"\n").await?;
         let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
         match v["type"].as_str() {
+            Some("system") if v["subtype"] == "init" => model = v["model"].as_str().map(String::from),
             Some("assistant") => log_progress(spec.role, &v),
             Some("result") => result = Some(v),
             _ => {}
@@ -110,14 +121,26 @@ pub async fn run(spec: AgentSpec, log: &Path) -> Result<AgentResult> {
         bail!("{} agent exited ({status}) without a result: {}", spec.role, err.trim());
     };
     let cost = res["total_cost_usd"].as_f64().unwrap_or(0.0);
-    if res["is_error"].as_bool().unwrap_or(false) {
-        bail!("{} agent failed ({}): {}", spec.role, res["subtype"], res["result"]);
+    let usage = &res["usage"];
+    let error = res["is_error"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(|| format!("{} agent failed ({}): {}", spec.role, res["subtype"], res["result"]));
+    if error.is_none() {
+        tracing::info!(role = spec.role, cost_usd = format!("{cost:.3}"), "agent done");
     }
-    tracing::info!(role = spec.role, cost_usd = format!("{cost:.3}"), "agent done");
     Ok(AgentResult {
         text: res["result"].as_str().unwrap_or_default().to_string(),
         structured: res.get("structured_output").filter(|v| !v.is_null()).cloned(),
         cost_usd: cost,
+        model: model.or(spec.model),
+        duration_ms: res["duration_ms"].as_i64(),
+        num_turns: res["num_turns"].as_i64(),
+        input_tokens: usage["input_tokens"].as_i64(),
+        output_tokens: usage["output_tokens"].as_i64(),
+        cache_read_tokens: usage["cache_read_input_tokens"].as_i64(),
+        cache_write_tokens: usage["cache_creation_input_tokens"].as_i64(),
+        error,
     })
 }
 

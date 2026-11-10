@@ -49,6 +49,21 @@ impl Adb {
         self.run(&["install", "-r", "-t", "-g", &apk.to_string_lossy()]).await
     }
 
+    /// MIUI/HyperOS asks the user to confirm the *first* USB install of a package
+    /// (updates via `install -r` are silent afterwards). Keep retrying while the
+    /// user confirms on the phone, up to `wait`.
+    pub async fn install_confirmed(&self, apk: &Path, wait: Duration) -> Result<Out> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let o = self.install(apk).await?;
+            let restricted = o.tail(4000).contains("INSTALL_FAILED_USER_RESTRICTED");
+            if o.ok || !restricted || std::time::Instant::now() >= deadline {
+                return Ok(o);
+            }
+            tracing::warn!("install needs confirmation: tap «Install» in the dialog on the phone");
+        }
+    }
+
     pub async fn launch(&self, pkg: &str) -> Result<Out> {
         self.run(&["shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"]).await
     }

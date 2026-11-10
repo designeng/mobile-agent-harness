@@ -1,5 +1,6 @@
 mod agent;
 mod config;
+mod db;
 mod device;
 mod github;
 mod mcp;
@@ -42,7 +43,7 @@ enum Cmd {
     },
     /// Show state of runs: stage, iteration, cost, QA/review verdicts.
     Status {
-        /// Only runs whose directory name contains this (e.g. `issue-2`).
+        /// Only runs whose name contains this (e.g. `issue-2`).
         run: Option<String>,
         /// How many most recent runs to show.
         #[arg(long, default_value_t = 5)]

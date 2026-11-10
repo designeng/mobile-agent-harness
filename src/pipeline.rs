@@ -2,6 +2,7 @@
 
 use crate::agent::{self, AgentSpec};
 use crate::config::Config;
+use crate::db::{Db, NewRun};
 use crate::device::{self, Adb};
 use crate::{github, mcp, shell};
 use anyhow::{Context, Result};
@@ -20,16 +21,60 @@ pub struct Run {
     pub dir: PathBuf,
     pub worktree: PathBuf,
     pub cost: f64,
+    db: Db,
+    id: i64,
+    /// Fix-loop iteration recorded on stages; 0 outside the loop.
+    iter: u32,
 }
 
 impl Run {
-    fn save(&self, name: &str, content: &str) -> Result<()> {
-        std::fs::write(self.dir.join(name), content).with_context(|| format!("writing {name}"))
+    /// Creates the artifacts dir and the `runs` row.
+    fn start(cfg: Config, kind: &str, issue: Option<u64>, title: Option<&str>) -> Result<Run> {
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let name = match issue {
+            Some(n) => format!("{ts}-issue-{n}"),
+            None => format!("{ts}-{kind}"),
+        };
+        let dir = cfg.state_dir().join("runs").join(&name);
+        std::fs::create_dir_all(&dir)?;
+        let db = Db::open(&cfg.state_dir())?;
+        let worktree = cfg.app.repo.clone();
+        let id = db.create_run(&NewRun { name: &name, kind, issue, title, dir: &dir, worktree: &worktree })?;
+        tracing::info!(run = %name, "run started");
+        Ok(Run { cfg, dir, worktree, cost: 0.0, db, id, iter: 0 })
     }
 
+    /// Records the run's outcome; passes the result through.
+    fn finish<T>(&self, res: Result<T>) -> Result<T> {
+        let err = res.as_ref().err().map(|e| format!("{e:#}"));
+        if let Err(e) = self.db.finish_run(self.id, err.as_deref()) {
+            tracing::error!("recording run outcome: {e:#}");
+        }
+        res
+    }
+
+    fn stage(&self, name: &str) -> Result<i64> {
+        self.db.stage_start(self.id, self.iter, name)
+    }
+
+    fn end(&self, stage: i64, ok: bool, log: Option<&Path>, detail: Option<&str>) -> Result<()> {
+        self.db.stage_end(stage, ok, log, detail)
+    }
+
+    /// Runs an agent as its own stage; the transcript goes to `log` in the run dir.
     async fn agent(&mut self, spec: AgentSpec, log: &str) -> Result<agent::AgentResult> {
-        let res = agent::run(spec, &self.dir.join(log)).await?;
+        let role = spec.role;
+        let path = self.dir.join(log);
+        let stage = self.stage(role)?;
+        let call = self.db.agent_start(self.id, stage, role, spec.model.as_deref(), &path)?;
+        let res = agent::run(spec, &path).await;
+        self.db.agent_end(call, &res)?;
+        self.end(stage, matches!(&res, Ok(r) if r.error.is_none()), None, None)?;
+        let res = res?;
         self.cost += res.cost_usd;
+        if let Some(e) = res.error {
+            anyhow::bail!(e);
+        }
         Ok(res)
     }
 
@@ -171,33 +216,47 @@ async fn prepare_worktree(cfg: &Config, issue: u64) -> Result<(PathBuf, String)>
     Ok((wt, branch))
 }
 
+/// Runs a shell gate as a stage, saving its output to `<name>-<iter>.log`.
+async fn gate_step(run: &Run, name: &str, cmd: &str) -> Result<shell::Out> {
+    tracing::info!("gate: {name}");
+    let stage = run.stage(name)?;
+    let out = shell::sh(cmd, &run.worktree, Duration::from_secs(1800)).await;
+    let log = run.dir.join(format!("{name}-{}.log", run.iter));
+    match &out {
+        Ok(o) => {
+            std::fs::write(&log, format!("{}\n{}", o.stdout, o.stderr))?;
+            run.end(stage, o.ok, Some(&log), None)?;
+        }
+        Err(e) => run.end(stage, false, None, Some(&format!("{e:#}")))?,
+    }
+    out
+}
+
 /// Deterministic gate: build + unit tests. Returns feedback for the developer on failure.
-async fn gate(cfg: &Config, wt: &Path, dir: &Path, iter: u32) -> Result<Option<String>> {
-    let long = Duration::from_secs(1800);
-    tracing::info!("gate: build");
-    let b = shell::sh(&cfg.app.build, wt, long).await?;
-    std::fs::write(dir.join(format!("build-{iter}.log")), format!("{}\n{}", b.stdout, b.stderr))?;
+async fn gate(run: &Run) -> Result<Option<String>> {
+    let cfg = &run.cfg;
+    let b = gate_step(run, "build", &cfg.app.build).await?;
     if !b.ok {
         return Ok(Some(format!("The build FAILED (`{}`):\n```\n{}\n```", cfg.app.build, b.tail(6000))));
     }
     if let Some(t) = &cfg.app.unit_tests {
-        tracing::info!("gate: unit tests");
-        let u = shell::sh(t, wt, long).await?;
-        std::fs::write(dir.join(format!("unit-{iter}.log")), format!("{}\n{}", u.stdout, u.stderr))?;
+        let u = gate_step(run, "unit", t).await?;
         if !u.ok {
             return Ok(Some(format!("Unit tests FAILED (`{t}`):\n```\n{}\n```", u.tail(6000))));
         }
     }
-    let apk = wt.join(&cfg.app.apk);
-    if !apk.exists() {
-        return Ok(Some(format!("Build succeeded but APK not found at {}", cfg.app.apk.display())));
+    if !run.worktree.join(&cfg.app.apk).exists() {
+        let msg = format!("Build succeeded but APK not found at {}", cfg.app.apk.display());
+        let stage = run.stage("apk")?;
+        run.end(stage, false, None, Some(&msg))?;
+        return Ok(Some(msg));
     }
     Ok(None)
 }
 
-/// Runs every saved Maestro flow. Returns failure descriptions.
-async fn regression(cfg: &Config, wt: &Path, adb: &Adb, dir: &Path) -> Vec<String> {
-    let flows = wt.join(&cfg.app.flows_dir);
+/// Runs every saved Maestro flow, one stage per flow. Returns failure descriptions.
+async fn regression(run: &Run, adb: &Adb) -> Result<Vec<String>> {
+    let flows = run.worktree.join(&run.cfg.app.flows_dir);
     let mut files: Vec<PathBuf> = std::fs::read_dir(&flows)
         .into_iter()
         .flatten()
@@ -209,26 +268,32 @@ async fn regression(cfg: &Config, wt: &Path, adb: &Adb, dir: &Path) -> Vec<Strin
     let mut fails = vec![];
     for f in files {
         tracing::info!("regression: {}", f.display());
-        if let Err(e) = mcp::run_maestro(adb, &cfg.device.maestro, &f, dir).await {
-            fails.push(format!("Regression flow {} failed:\n{e}", f.display()));
+        let stage = run.stage("regression")?;
+        let res = mcp::run_maestro(adb, &run.cfg.device.maestro, &f, &run.dir).await;
+        let flow = f.display().to_string();
+        run.end(stage, res.is_ok(), None, Some(&flow))?;
+        if let Err(e) = res {
+            fails.push(format!("Regression flow {flow} failed:\n{e}"));
         }
     }
-    fails
+    Ok(fails)
 }
 
 pub async fn run_issue(cfg: Config, issue_no: u64, open_pr: bool) -> Result<()> {
-    let issue = github::fetch_issue(&cfg.github.repo, issue_no).await?;
-    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let dir = cfg.state_dir().join("runs").join(format!("{ts}-issue-{issue_no}"));
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("run.pid"), std::process::id().to_string())?;
-    let (worktree, branch) = prepare_worktree(&cfg, issue_no).await?;
-    tracing::info!(run = %dir.display(), worktree = %worktree.display(), "run started");
-    let adb = Adb::resolve(&cfg.device.adb, cfg.device.serial.as_deref()).await?;
+    let mut run = Run::start(cfg, "issue", Some(issue_no), None)?;
+    let res = issue_inner(&mut run, issue_no, open_pr).await;
+    run.finish(res)
+}
 
-    let mut run = Run { cfg, dir, worktree, cost: 0.0 };
+async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool) -> Result<()> {
+    let issue = github::fetch_issue(&run.cfg.github.repo, issue_no).await?;
     let issue_md = issue.as_markdown();
-    run.save("issue.md", &issue_md)?;
+    run.db.set_issue(run.id, &issue.title, &issue_md)?;
+    let (worktree, branch) = prepare_worktree(&run.cfg, issue_no).await?;
+    run.db.set_worktree(run.id, &worktree, &branch)?;
+    run.worktree = worktree;
+    tracing::info!(dir = %run.dir.display(), worktree = %run.worktree.display(), "worktree ready");
+    let adb = Adb::resolve(&run.cfg.device.adb, run.cfg.device.serial.as_deref()).await?;
 
     let contract = format!(
         "\n# Build contract (the harness enforces this)\n- Build: `{}` (run from the repo root)\n- APK expected at: `{}`\n- Unit tests: `{}`\n- Must run on a real device WITHOUT a dev server (JS bundle embedded in the APK).\n",
@@ -244,7 +309,7 @@ pub async fn run_issue(cfg: Config, issue_no: u64, open_pr: bool) -> Result<()> 
     spec.json_schema = Some(plan_schema());
     let plan = run.agent(spec, "planner.jsonl").await?.structured.context("planner returned no plan")?;
     let plan_md = render_plan(&plan);
-    run.save("plan.md", &plan_md)?;
+    run.db.set_plan(run.id, &plan, &plan_md)?;
 
     let mcp_cfg = run.write_mcp_config(&adb.serial)?;
     let flows_rel = run.cfg.app.flows_dir.display().to_string();
@@ -252,6 +317,7 @@ pub async fn run_issue(cfg: Config, issue_no: u64, open_pr: bool) -> Result<()> 
     let mut review: Option<Value> = None;
 
     for iter in 1..=run.cfg.agents.max_fix_iterations {
+        run.iter = iter;
         tracing::info!(iter, "iteration");
         // 2. Develop
         let mut prompt = format!("{issue_md}\n\n# Plan\n{plan_md}\n{contract}");
@@ -267,11 +333,10 @@ pub async fn run_issue(cfg: Config, issue_no: u64, open_pr: bool) -> Result<()> 
         ]
         .map(String::from)
         .to_vec();
-        let dev = run.agent(spec, &format!("developer-{iter}.jsonl")).await?;
-        run.save(&format!("developer-{iter}.md"), &dev.text)?;
+        run.agent(spec, &format!("developer-{iter}.jsonl")).await?;
 
         // 3. Deterministic gate
-        if let Some(f) = gate(&run.cfg, &run.worktree, &run.dir, iter).await? {
+        if let Some(f) = gate(run).await? {
             tracing::warn!("gate failed");
             feedback = Some(f);
             continue;
@@ -280,12 +345,16 @@ pub async fn run_issue(cfg: Config, issue_no: u64, open_pr: bool) -> Result<()> 
         // 4. Device: install, regression, exploratory QA — under an exclusive lease.
         let qa = {
             let _lease = device::acquire_lease(&adb.serial, &format!("issue-{issue_no}")).await?;
-            let inst = adb.install(&run.worktree.join(&run.cfg.app.apk)).await?;
+            let stage = run.stage("install")?;
+            let apk = run.worktree.join(&run.cfg.app.apk);
+            let inst = adb.install_confirmed(&apk, Duration::from_secs(120)).await?;
+            run.end(stage, inst.ok, None, (!inst.ok).then(|| inst.tail(3000)).as_deref())?;
             if !inst.ok {
-                feedback = Some(format!("APK install failed:\n{}", inst.tail(3000)));
-                continue;
+                // The APK was built fine: this is a device/environment problem, not
+                // something the developer agent can fix — don't burn an iteration on it.
+                anyhow::bail!("APK install failed on the device (environment problem):\n{}", inst.tail(3000));
             }
-            let reg_fails = regression(&run.cfg, &run.worktree, &adb, &run.dir).await;
+            let reg_fails = regression(run, &adb).await?;
             let _ = adb.logcat_clear().await;
             let mut prompt = format!(
                 "{issue_md}\n\n# Plan\n{plan_md}\n\nThe new build is already installed. \
@@ -307,7 +376,7 @@ pub async fn run_issue(cfg: Config, issue_no: u64, open_pr: bool) -> Result<()> 
             spec.disallowed_tools = vec!["Bash".into(), "WebFetch".into(), "WebSearch".into()];
             spec.json_schema = Some(qa_schema());
             let qa = run.agent(spec, &format!("qa-{iter}.jsonl")).await?.structured.context("qa returned no verdict")?;
-            run.save(&format!("qa-{iter}.json"), &serde_json::to_string_pretty(&qa)?)?;
+            run.db.save_qa(run.id, iter, &qa)?;
             qa
         };
 
@@ -333,7 +402,7 @@ pub async fn run_issue(cfg: Config, issue_no: u64, open_pr: bool) -> Result<()> 
             .to_vec();
         spec.json_schema = Some(review_schema());
         let r = run.agent(spec, &format!("review-{iter}.jsonl")).await?.structured.context("reviewer returned nothing")?;
-        run.save(&format!("review-{iter}.json"), &serde_json::to_string_pretty(&r)?)?;
+        run.db.save_review(run.id, iter, &r)?;
         if r["approve"] == true {
             review = Some(r);
             break;
@@ -341,37 +410,44 @@ pub async fn run_issue(cfg: Config, issue_no: u64, open_pr: bool) -> Result<()> 
         let comments: Vec<&str> = r["blocking_comments"].as_array().into_iter().flatten().filter_map(|c| c.as_str()).collect();
         feedback = Some(format!("Code review requested changes:\n- {}", comments.join("\n- ")));
     }
+    run.iter = 0;
 
+    let max = run.cfg.agents.max_fix_iterations;
     let Some(review) = review else {
-        run.save("summary.md", &format!("FAILED after {} iterations. Last feedback:\n\n{}\n", run.cfg.agents.max_fix_iterations, feedback.unwrap_or_default()))?;
-        anyhow::bail!("issue #{issue_no}: not done after {} iterations (cost ${:.2}); see {}", run.cfg.agents.max_fix_iterations, run.cost, run.dir.display());
+        run.db.set_summary(run.id, &format!("Last feedback:\n\n{}\n", feedback.unwrap_or_default()))?;
+        anyhow::bail!("not done after {max} iterations (cost ${:.2}); see `harness status issue-{issue_no}`", run.cost);
     };
 
     // 6. Commit (+ optional PR)
+    let stage = run.stage("commit")?;
     let title = review["pr_title"].as_str().unwrap_or(&issue.title).to_string();
     shell::check("git", &["add", "-A"], &run.worktree).await?;
     let _ = std::fs::remove_file(run.worktree.join("local.properties"));
     shell::check("git", &["commit", "-m", &format!("{title}\n\nCloses #{issue_no}")], &run.worktree).await?;
+    run.end(stage, true, None, None)?;
     let mut summary = format!("DONE: {title}\nbranch: {branch}\ncost: ${:.2}\n", run.cost);
     if open_pr {
+        let stage = run.stage("pr")?;
         let body = format!("{}\n\nCloses #{issue_no}\n\nVerified on a real device by the harness QA agent. Run artifacts: `{}`", review["pr_body"].as_str().unwrap_or(""), run.dir.display());
         let url = github::open_pr(&run.worktree, &run.cfg.github.repo, &run.cfg.app.base_branch, &branch, &title, &body).await?;
+        run.end(stage, true, None, Some(&url))?;
+        run.db.set_pr(run.id, &url)?;
         let _ = writeln!(summary, "PR: {url}");
     }
-    run.save("summary.md", &summary)?;
+    run.db.set_summary(run.id, &summary)?;
     println!("{summary}");
     Ok(())
 }
 
 /// Ad-hoc exploratory QA on whatever build is installed — no issue, no code changes.
 pub async fn explore(cfg: Config, goal: String) -> Result<()> {
-    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let dir = cfg.state_dir().join("runs").join(format!("{ts}-explore"));
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("run.pid"), std::process::id().to_string())?;
-    let adb = Adb::resolve(&cfg.device.adb, cfg.device.serial.as_deref()).await?;
-    let worktree = cfg.app.repo.clone();
-    let mut run = Run { cfg, dir, worktree, cost: 0.0 };
+    let mut run = Run::start(cfg, "explore", None, Some(&goal))?;
+    let res = explore_inner(&mut run, &goal).await;
+    run.finish(res)
+}
+
+async fn explore_inner(run: &mut Run, goal: &str) -> Result<()> {
+    let adb = Adb::resolve(&run.cfg.device.adb, run.cfg.device.serial.as_deref()).await?;
     let mcp_cfg = run.write_mcp_config(&adb.serial)?;
     let _lease = device::acquire_lease(&adb.serial, "explore").await?;
     let _ = adb.logcat_clear().await;
@@ -393,8 +469,9 @@ pub async fn explore(cfg: Config, goal: String) -> Result<()> {
     spec.disallowed_tools = vec!["Bash".into(), "WebFetch".into(), "WebSearch".into()];
     spec.json_schema = Some(qa_schema());
     let qa = run.agent(spec, "qa.jsonl").await?.structured.context("no verdict")?;
-    let pretty = serde_json::to_string_pretty(&qa)?;
-    run.save("qa.json", &pretty)?;
-    println!("{pretty}\n\nartifacts: {}\ncost: ${:.2}", run.dir.display(), run.cost);
+    run.db.save_qa(run.id, 0, &qa)?;
+    let verdict = qa["verdict"].as_str().unwrap_or("?");
+    run.db.set_summary(run.id, &format!("QA: {verdict}"))?;
+    println!("{}\n\nartifacts: {}\ncost: ${:.2}", serde_json::to_string_pretty(&qa)?, run.dir.display(), run.cost);
     Ok(())
 }

@@ -1,25 +1,9 @@
-//! `harness status`: derive run state from the artifacts in `.harness/runs/`.
-//! No separate state file: the files the pipeline already writes are the source of truth.
+//! `harness status`: run state from `.harness/harness.db`.
 
 use crate::config::Config;
+use crate::db::{Db, RunRow};
 use anyhow::Result;
-use serde_json::Value;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
-
-/// Runs without a pid file (made before it existed) count as live if touched this recently.
-const LEGACY_LIVE_WINDOW: Duration = Duration::from_secs(30 * 60);
-
-struct RunInfo {
-    name: String,
-    state: State,
-    stage: String,
-    iter: u32,
-    cost: f64,
-    last_activity: Option<SystemTime>,
-    verdict: String,
-    head: String,
-}
 
 #[derive(PartialEq, Clone, Copy)]
 enum State {
@@ -40,33 +24,46 @@ impl State {
     }
 }
 
+struct RunInfo {
+    name: String,
+    state: State,
+    stage: String,
+    iter: u32,
+    cost: f64,
+    idle: Option<Duration>,
+    verdict: String,
+    head: String,
+}
+
 pub fn show(cfg: &Config, run: Option<&str>, last: usize, json: bool) -> Result<()> {
-    let runs_dir = cfg.state_dir().join("runs");
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&runs_dir)
-        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect())
-        .unwrap_or_default();
-    dirs.sort(); // names start with a timestamp
-    if let Some(r) = run {
-        dirs.retain(|p| p.file_name().is_some_and(|n| n.to_string_lossy().contains(r)));
+    let db_path = cfg.state_dir().join("harness.db");
+    if !db_path.exists() {
+        println!("no runs yet ({} does not exist)", db_path.display());
+        return Ok(());
     }
-    let skip = dirs.len().saturating_sub(last);
-    let infos: Vec<RunInfo> = dirs.iter().skip(skip).map(|d| inspect(d)).collect();
+    let db = Db::open(&cfg.state_dir())?;
+    let infos: Vec<RunInfo> = db.recent_runs(run, last)?.into_iter().map(info).collect();
 
     if infos.is_empty() {
-        println!("no runs in {}", runs_dir.display());
+        println!("no runs{}", run.map(|r| format!(" matching '{r}'")).unwrap_or_default());
         return Ok(());
     }
     if json {
-        let v: Vec<Value> = infos.iter().map(|i| serde_json::json!({
-            "run": i.name, "state": i.state.label().to_lowercase(), "stage": i.stage,
-            "iteration": i.iter, "cost_usd": i.cost, "verdict": i.verdict,
-            "idle_secs": i.last_activity.and_then(|t| t.elapsed().ok()).map(|d| d.as_secs()),
-        })).collect();
+        let v: Vec<serde_json::Value> = infos
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "run": i.name, "state": i.state.label().to_lowercase(), "stage": i.stage,
+                    "iteration": i.iter, "cost_usd": i.cost, "verdict": i.verdict,
+                    "idle_secs": i.idle.map(|d| d.as_secs()),
+                })
+            })
+            .collect();
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
     for i in &infos {
-        let idle = i.last_activity.and_then(|t| t.elapsed().ok()).map(fmt_dur).unwrap_or_else(|| "?".into());
+        let idle = i.idle.map(fmt_dur).unwrap_or_else(|| "?".into());
         println!("{:<8} {}", i.state.label(), i.name);
         println!("         stage: {} | iteration: {} | cost: ${:.2} | last activity: {idle} ago", i.stage, i.iter, i.cost);
         if !i.verdict.is_empty() {
@@ -79,80 +76,63 @@ pub fn show(cfg: &Config, run: Option<&str>, last: usize, json: bool) -> Result<
     Ok(())
 }
 
-fn inspect(dir: &Path) -> RunInfo {
-    let name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let mut files: Vec<(String, SystemTime)> = std::fs::read_dir(dir)
-        .map(|rd| rd.filter_map(|e| e.ok()).filter_map(|e| Some((e.file_name().to_string_lossy().into_owned(), e.metadata().ok()?.modified().ok()?))).collect())
-        .unwrap_or_default();
-    files.sort_by_key(|(_, t)| *t);
-    let last_activity = files.last().map(|(_, t)| *t);
-
-    let iter = files.iter().filter_map(|(n, _)| n.strip_prefix("developer-")?.strip_suffix(".jsonl")?.parse::<u32>().ok()).max().unwrap_or(0);
-    let cost: f64 = files.iter().filter(|(n, _)| n.ends_with(".jsonl")).map(|(n, _)| transcript_cost(&dir.join(n))).sum();
-    let stage = files.iter().rev().find_map(|(n, _)| stage_of(n)).unwrap_or_else(|| "starting".into());
-
-    let summary = std::fs::read_to_string(dir.join("summary.md")).ok();
-    let head = summary.as_deref().and_then(|s| s.lines().next()).unwrap_or("").to_string();
-    let live = match std::fs::read_to_string(dir.join("run.pid")).ok().and_then(|p| p.trim().parse::<u32>().ok()) {
-        Some(pid) => pid_alive(pid),
-        None => last_activity.and_then(|t| t.elapsed().ok()).is_some_and(|d| d < LEGACY_LIVE_WINDOW),
+fn info(r: RunRow) -> RunInfo {
+    let state = match r.status.as_str() {
+        "done" => State::Done,
+        "failed" => State::Failed,
+        _ if pid_alive(r.pid) => State::Running,
+        _ => State::Crashed,
     };
-    let state = match &summary {
-        Some(s) if s.starts_with("FAILED") => State::Failed,
-        Some(_) => State::Done,
-        None if live => State::Running,
-        None => State::Crashed,
-    };
-    let stage = if state == State::Crashed { format!("{stage} (process gone, see .harness/run-*.log)") } else { stage };
-
-    // Latest QA verdict / review decision.
-    let latest = |prefix: &str| files.iter().rev().find(|(n, _)| n.starts_with(prefix) && n.ends_with(".json")).map(|(n, _)| n.clone());
-    let read = |f: Option<String>| f.and_then(|f| Some((f.clone(), serde_json::from_str::<Value>(&std::fs::read_to_string(dir.join(&f)).ok()?).ok()?)));
-    let mut verdict = Vec::new();
-    if let Some((_, q)) = read(latest("qa")) {
-        let bugs = q["bugs"].as_array().map_or(0, |b| b.len());
-        verdict.push(format!("QA: {} ({bugs} bugs)", q["verdict"].as_str().unwrap_or("?")));
-    }
-    if let Some((_, r)) = read(latest("review")) {
-        let n = r["blocking_comments"].as_array().map_or(0, |b| b.len());
-        verdict.push(format!("review: {} ({n} blocking)", if r["approve"] == true { "approved" } else { "changes requested" }));
-    }
-    RunInfo { name, state, stage, iter, cost, last_activity, verdict: verdict.join(" | "), head }
-}
-
-fn stage_of(file: &str) -> Option<String> {
-    let num = |p: &str, s: &str| file.strip_prefix(p)?.strip_suffix(s)?.parse::<u32>().ok();
-    Some(match file {
-        "summary.md" => "finished".into(),
-        "planner.jsonl" => "planning".into(),
-        "plan.md" => "planned".into(),
-        "qa.jsonl" => "exploring on device".into(),
-        "qa.json" => "finished".into(),
-        _ => {
-            if let Some(n) = num("developer-", ".jsonl") { format!("developing (#{n})") }
-            else if let Some(n) = num("developer-", ".md") { format!("developer done, gate (#{n})") }
-            else if let Some(n) = num("build-", ".log") { format!("build gate (#{n})") }
-            else if let Some(n) = num("unit-", ".log") { format!("unit tests (#{n})") }
-            else if let Some(n) = num("qa-", ".jsonl") { format!("device QA (#{n})") }
-            else if let Some(n) = num("qa-", ".json") { format!("QA done (#{n})") }
-            else if let Some(n) = num("review-", ".jsonl") { format!("code review (#{n})") }
-            else if let Some(n) = num("review-", ".json") { format!("review done (#{n})") }
-            else { return None }
+    let mut stage = match (&r.stage, state) {
+        (_, State::Done) => "finished".to_string(),
+        (None, _) => "starting".to_string(),
+        (Some((name, iter, finished)), _) => {
+            let label = stage_label(name);
+            let n = if *iter > 0 { format!(" (#{iter})") } else { String::new() };
+            if *finished { format!("{label} done{n}") } else { format!("{label}{n}") }
         }
-    })
+    };
+    if state == State::Crashed {
+        stage.push_str(" (process gone, see .harness/run-*.log)");
+    }
+
+    // A live agent writes to its transcript long before the DB hears about it.
+    let db_time = r.last_activity.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(SystemTime::from);
+    let file_time = r.live_transcript.as_deref().and_then(|p| std::fs::metadata(p).ok()?.modified().ok());
+    let idle = db_time.max(file_time).and_then(|t| t.elapsed().ok());
+
+    let mut verdict = Vec::new();
+    if let Some((v, bugs)) = &r.qa {
+        verdict.push(format!("QA: {v} ({bugs} bugs)"));
+    }
+    if let Some((approve, n)) = r.review {
+        verdict.push(format!("review: {} ({n} blocking)", if approve { "approved" } else { "changes requested" }));
+    }
+    let head = match state {
+        State::Failed => r.error.as_deref().and_then(|e| e.lines().next()).unwrap_or("").to_string(),
+        _ => match (&r.pr_url, r.summary.as_deref().and_then(|s| s.lines().next())) {
+            (Some(url), Some(h)) => format!("{h} | {url}"),
+            (_, h) => h.unwrap_or("").to_string(),
+        },
+    };
+    RunInfo { name: r.name, state, stage, iter: r.iter, cost: r.cost, idle, verdict: verdict.join(" | "), head }
 }
 
-/// Cost from the transcript's final `result` event (cheap check first to skip big lines).
-fn transcript_cost(path: &Path) -> f64 {
-    let Ok(text) = std::fs::read_to_string(path) else { return 0.0 };
-    text.lines()
-        .rev()
-        .filter(|l| l.contains("\"total_cost_usd\""))
-        .find_map(|l| {
-            let v = serde_json::from_str::<Value>(l).ok()?;
-            (v["type"] == "result").then(|| v["total_cost_usd"].as_f64()).flatten()
-        })
-        .unwrap_or(0.0)
+fn stage_label(name: &str) -> &str {
+    match name {
+        "planner" => "planning",
+        "developer" => "developing",
+        "build" => "build gate",
+        "unit" => "unit tests",
+        "apk" => "apk check",
+        "install" => "installing on device",
+        "regression" => "regression flows",
+        "qa" => "device QA",
+        "reviewer" => "code review",
+        "commit" => "commit",
+        "pr" => "opening PR",
+        other => other,
+    }
 }
 
 fn pid_alive(pid: u32) -> bool {
