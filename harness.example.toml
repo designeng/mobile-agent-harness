@@ -22,3 +22,10 @@ model = "claude-opus-5-5"           # developer + QA
 light_model = "claude-sonnet-5-5"   # planner + reviewer
 max_fix_iterations = 3
 mobile_mcp = ["npx", "-y", "@mobilenext/mobile-mcp@1.0.16"]
+
+[queue]
+label = "agent-ready"               # only issues with this label are picked by `harness queue`
+# budget_usd = 30.0                 # stop starting new issues after this much spent
+max_consecutive_failures = 2
+# Issues with agent:in-progress / agent:done / agent:failed / blocked are skipped,
+# as are issues whose body says "Depends on #N" / "Blocked by #N" while #N is open.

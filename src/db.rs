@@ -315,6 +315,16 @@ impl Db {
         Ok(())
     }
 
+    /// Id of the newest run, 0 if none; a marker for `cost_since`.
+    pub fn max_run_id(&self) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM runs", [], |r| r.get(0))?)
+    }
+
+    /// Total agent cost of runs created after run `after`.
+    pub fn cost_since(&self, after: i64) -> Result<f64> {
+        Ok(self.conn.query_row("SELECT COALESCE(SUM(cost_usd), 0) FROM agent_calls WHERE run_id > ?1", [after], |r| r.get(0))?)
+    }
+
     /// Most recent `last` runs whose name contains `filter`, oldest first.
     pub fn recent_runs(&self, filter: Option<&str>, last: usize) -> Result<Vec<RunRow>> {
         let pattern = format!("%{}%", filter.unwrap_or(""));
@@ -436,6 +446,9 @@ mod tests {
         assert_eq!(r.review, Some((false, 2)));
         assert!(r.live_transcript.is_none());
         assert!(db.recent_runs(Some("issue-8"), 5)?.is_empty());
+        assert_eq!(db.max_run_id()?, run);
+        assert_eq!(db.cost_since(run - 1)?, 0.5);
+        assert_eq!(db.cost_since(run)?, 0.0);
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

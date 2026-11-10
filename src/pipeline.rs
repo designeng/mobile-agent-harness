@@ -16,6 +16,18 @@ const DEVELOPER: &str = include_str!("../prompts/developer.md");
 const QA: &str = include_str!("../prompts/qa.md");
 const REVIEWER: &str = include_str!("../prompts/reviewer.md");
 
+/// Device/environment failure: not the issue's fault, so a queue should stop rather than mark it failed.
+#[derive(Debug)]
+pub struct EnvError(pub String);
+
+impl std::fmt::Display for EnvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EnvError {}
+
 pub struct Run {
     pub cfg: Config,
     pub dir: PathBuf,
@@ -29,7 +41,7 @@ pub struct Run {
 
 impl Run {
     /// Creates the artifacts dir and the `runs` row.
-    fn start(cfg: Config, kind: &str, issue: Option<u64>, title: Option<&str>) -> Result<Run> {
+    pub(crate) fn start(cfg: Config, kind: &str, issue: Option<u64>, title: Option<&str>) -> Result<Run> {
         let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
         let name = match issue {
             Some(n) => format!("{ts}-issue-{n}"),
@@ -45,12 +57,16 @@ impl Run {
     }
 
     /// Records the run's outcome; passes the result through.
-    fn finish<T>(&self, res: Result<T>) -> Result<T> {
+    pub(crate) fn finish<T>(&self, res: Result<T>) -> Result<T> {
         let err = res.as_ref().err().map(|e| format!("{e:#}"));
         if let Err(e) = self.db.finish_run(self.id, err.as_deref()) {
             tracing::error!("recording run outcome: {e:#}");
         }
         res
+    }
+
+    pub(crate) fn set_summary(&self, summary: &str) -> Result<()> {
+        self.db.set_summary(self.id, summary)
     }
 
     fn stage(&self, name: &str) -> Result<i64> {
@@ -62,7 +78,7 @@ impl Run {
     }
 
     /// Runs an agent as its own stage; the transcript goes to `log` in the run dir.
-    async fn agent(&mut self, spec: AgentSpec, log: &str) -> Result<agent::AgentResult> {
+    pub(crate) async fn agent(&mut self, spec: AgentSpec, log: &str) -> Result<agent::AgentResult> {
         let role = spec.role;
         let path = self.dir.join(log);
         let stage = self.stage(role)?;
@@ -293,7 +309,9 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool) -> Result<()> 
     run.db.set_worktree(run.id, &worktree, &branch)?;
     run.worktree = worktree;
     tracing::info!(dir = %run.dir.display(), worktree = %run.worktree.display(), "worktree ready");
-    let adb = Adb::resolve(&run.cfg.device.adb, run.cfg.device.serial.as_deref()).await?;
+    let adb = Adb::resolve(&run.cfg.device.adb, run.cfg.device.serial.as_deref())
+        .await
+        .map_err(|e| EnvError(format!("device: {e:#}")))?;
 
     let contract = format!(
         "\n# Build contract (the harness enforces this)\n- Build: `{}` (run from the repo root)\n- APK expected at: `{}`\n- Unit tests: `{}`\n- Must run on a real device WITHOUT a dev server (JS bundle embedded in the APK).\n",
@@ -352,7 +370,7 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool) -> Result<()> 
             if !inst.ok {
                 // The APK was built fine: this is a device/environment problem, not
                 // something the developer agent can fix — don't burn an iteration on it.
-                anyhow::bail!("APK install failed on the device (environment problem):\n{}", inst.tail(3000));
+                return Err(EnvError(format!("APK install failed on the device (environment problem):\n{}", inst.tail(3000))).into());
             }
             let reg_fails = regression(run, &adb).await?;
             let _ = adb.logcat_clear().await;
@@ -382,7 +400,7 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool) -> Result<()> 
 
         match qa["verdict"].as_str() {
             Some("pass") => {}
-            Some("blocked") => anyhow::bail!("QA blocked (environment problem): {}", qa["notes"]),
+            Some("blocked") => return Err(EnvError(format!("QA blocked (environment problem): {}", qa["notes"])).into()),
             _ => {
                 feedback = Some(render_qa_feedback(&qa));
                 continue;

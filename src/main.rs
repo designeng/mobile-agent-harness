@@ -5,6 +5,7 @@ mod device;
 mod github;
 mod mcp;
 mod pipeline;
+mod queue;
 mod shell;
 mod status;
 
@@ -34,6 +35,23 @@ enum Cmd {
         /// Push the branch and open a draft PR at the end.
         #[arg(long)]
         pr: bool,
+    },
+    /// Run open issues labelled ready (see [queue] in harness.toml) one by one; an agent picks the order.
+    Queue {
+        #[arg(long, default_value = "harness.toml")]
+        config: PathBuf,
+        /// Stop after starting this many issues.
+        #[arg(long)]
+        max_issues: Option<u32>,
+        /// Stop starting new issues once this much is spent (overrides [queue] budget_usd).
+        #[arg(long)]
+        budget_usd: Option<f64>,
+        /// Commit locally only, don't push or open draft PRs.
+        #[arg(long)]
+        no_pr: bool,
+        /// Show the picked order and exit.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Exploratory QA of the installed app with a free-form goal (no code changes).
     Explore {
@@ -86,6 +104,10 @@ async fn main() -> Result<()> {
         Cmd::Run { issue, config, pr } => {
             let cfg = config::Config::load(&config)?;
             pipeline::run_issue(cfg, issue, pr).await
+        }
+        Cmd::Queue { config, max_issues, budget_usd, no_pr, dry_run } => {
+            let cfg = config::Config::load(&config)?;
+            queue::run(cfg, queue::QueueOpts { max_issues, budget_usd, pr: !no_pr, dry_run }).await
         }
         Cmd::Explore { goal, config } => {
             let cfg = config::Config::load(&config)?;

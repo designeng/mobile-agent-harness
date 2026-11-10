@@ -10,6 +10,8 @@ pub struct Config {
     pub github: GithubCfg,
     #[serde(default)]
     pub agents: AgentsCfg,
+    #[serde(default)]
+    pub queue: QueueCfg,
     /// Directory containing harness.toml; relative paths resolve against it.
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -62,6 +64,24 @@ pub struct AgentsCfg {
     pub mobile_mcp: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueueCfg {
+    /// Only open issues with this label are eligible for `harness queue`.
+    #[serde(default = "d_ready_label")]
+    pub label: String,
+    /// Stop starting new issues once runs since the queue started cost this much.
+    pub budget_usd: Option<f64>,
+    /// Stop after this many issues fail in a row.
+    #[serde(default = "d_max_failures")]
+    pub max_consecutive_failures: u32,
+}
+
+impl Default for QueueCfg {
+    fn default() -> Self {
+        Self { label: d_ready_label(), budget_usd: None, max_consecutive_failures: d_max_failures() }
+    }
+}
+
 impl Default for DeviceCfg {
     fn default() -> Self {
         Self { serial: None, adb: d_adb(), maestro: d_maestro() }
@@ -79,6 +99,8 @@ fn d_branch() -> String { "main".into() }
 fn d_adb() -> String { "adb".into() }
 fn d_maestro() -> String { "~/.maestro/maestro/bin/maestro".into() }
 fn d_iters() -> u32 { 3 }
+fn d_ready_label() -> String { "agent-ready".into() }
+fn d_max_failures() -> u32 { 2 }
 fn d_mobile_mcp() -> Vec<String> {
     ["npx", "-y", "@mobilenext/mobile-mcp@1.0.16"].map(String::from).to_vec()
 }
