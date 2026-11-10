@@ -23,6 +23,18 @@ light_model = "claude-sonnet-5-5"   # planner + reviewer
 max_fix_iterations = 3
 mobile_mcp = ["npx", "-y", "@mobilenext/mobile-mcp@1.0.16"]
 
+[skills]
+# Claude Code skills (folders with SKILL.md) handed to agents per role.
+# Each name is a folder in `dir`; it is copied into the run dir and attached via --add-dir.
+# Skills in the app repo's own .claude/skills/ are picked up automatically.
+dir = "skills"                      # relative to this file
+all = []                            # every role
+# planner = []
+# developer = ["expo-native-modules"]
+# qa = ["maestro-flows"]            # also used by `harness explore`
+# reviewer = []
+# picker = []
+
 [queue]
 label = "agent-ready"               # only issues with this label are picked by `harness queue`
 # budget_usd = 30.0                 # stop starting new issues after this much spent

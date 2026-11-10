@@ -12,6 +12,8 @@ pub struct Config {
     pub agents: AgentsCfg,
     #[serde(default)]
     pub queue: QueueCfg,
+    #[serde(default)]
+    pub skills: SkillsCfg,
     /// Directory containing harness.toml; relative paths resolve against it.
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -76,6 +78,43 @@ pub struct QueueCfg {
     pub max_consecutive_failures: u32,
 }
 
+/// Claude Code skills handed to agents, per role. Each name is a folder `<dir>/<name>/SKILL.md`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsCfg {
+    /// Skills library, relative to harness.toml.
+    #[serde(default = "d_skills_dir")]
+    pub dir: PathBuf,
+    /// Given to every role.
+    #[serde(default)]
+    pub all: Vec<String>,
+    #[serde(default)]
+    pub planner: Vec<String>,
+    #[serde(default)]
+    pub developer: Vec<String>,
+    /// Also used by `harness explore`.
+    #[serde(default)]
+    pub qa: Vec<String>,
+    #[serde(default)]
+    pub reviewer: Vec<String>,
+    #[serde(default)]
+    pub picker: Vec<String>,
+}
+
+impl Default for SkillsCfg {
+    fn default() -> Self {
+        Self {
+            dir: d_skills_dir(),
+            all: vec![],
+            planner: vec![],
+            developer: vec![],
+            qa: vec![],
+            reviewer: vec![],
+            picker: vec![],
+        }
+    }
+}
+
 impl Default for QueueCfg {
     fn default() -> Self {
         Self { label: d_ready_label(), budget_usd: None, max_consecutive_failures: d_max_failures() }
@@ -101,6 +140,7 @@ fn d_maestro() -> String { "~/.maestro/maestro/bin/maestro".into() }
 fn d_iters() -> u32 { 3 }
 fn d_ready_label() -> String { "agent-ready".into() }
 fn d_max_failures() -> u32 { 2 }
+fn d_skills_dir() -> PathBuf { "skills".into() }
 fn d_mobile_mcp() -> Vec<String> {
     ["npx", "-y", "@mobilenext/mobile-mcp@1.0.16"].map(String::from).to_vec()
 }
@@ -122,6 +162,9 @@ impl Config {
             cfg.app.repo = cfg.base_dir.join(&cfg.app.repo);
         }
         cfg.device.maestro = expand_home(&cfg.device.maestro);
+        if cfg.skills.dir.is_relative() {
+            cfg.skills.dir = cfg.base_dir.join(&cfg.skills.dir);
+        }
         Ok(cfg)
     }
 
@@ -136,5 +179,51 @@ impl Config {
 
     pub fn light_model(&self) -> Option<&str> {
         self.agents.light_model.as_deref().or(self.dev_model())
+    }
+
+    /// Skill names for a role (`all` first, deduplicated).
+    pub fn skills_for(&self, role: &str) -> Vec<&str> {
+        let s = &self.skills;
+        let role_list = match role {
+            "planner" => &s.planner,
+            "developer" => &s.developer,
+            "qa" => &s.qa,
+            "reviewer" => &s.reviewer,
+            "picker" => &s.picker,
+            _ => &s.all, // unknown role: `all` only (deduped below)
+        };
+        let mut out: Vec<&str> = vec![];
+        for n in s.all.iter().chain(role_list) {
+            if !out.contains(&n.as_str()) {
+                out.push(n);
+            }
+        }
+        out
+    }
+
+    /// Checks every configured skill exists; returns the distinct names.
+    pub fn check_skills(&self) -> Result<Vec<String>> {
+        let s = &self.skills;
+        let mut names: Vec<String> = vec![];
+        for n in [&s.all, &s.planner, &s.developer, &s.qa, &s.reviewer, &s.picker].into_iter().flatten() {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+        for n in &names {
+            self.skill_path(n)?;
+        }
+        Ok(names)
+    }
+
+    /// Folder of a skill in the library; errors if it has no SKILL.md.
+    pub fn skill_path(&self, name: &str) -> Result<PathBuf> {
+        anyhow::ensure!(
+            !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != "..",
+            "bad skill name {name:?}"
+        );
+        let p = self.skills.dir.join(name);
+        anyhow::ensure!(p.join("SKILL.md").is_file(), "skill {name:?}: no {}", p.join("SKILL.md").display());
+        Ok(p)
     }
 }

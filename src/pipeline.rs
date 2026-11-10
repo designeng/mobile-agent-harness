@@ -78,8 +78,11 @@ impl Run {
     }
 
     /// Runs an agent as its own stage; the transcript goes to `log` in the run dir.
-    pub(crate) async fn agent(&mut self, spec: AgentSpec, log: &str) -> Result<agent::AgentResult> {
+    pub(crate) async fn agent(&mut self, mut spec: AgentSpec, log: &str) -> Result<agent::AgentResult> {
         let role = spec.role;
+        if let Some(dir) = self.skills_bundle(role)? {
+            spec.add_dirs.push(dir);
+        }
         let path = self.dir.join(log);
         let stage = self.stage(role)?;
         let call = self.db.agent_start(self.id, stage, role, spec.model.as_deref(), &path)?;
@@ -92,6 +95,26 @@ impl Run {
             anyhow::bail!(e);
         }
         Ok(res)
+    }
+
+    /// Copies the role's configured skills into `<run>/skills-<role>/.claude/skills/`, which
+    /// `claude` loads from an `--add-dir`. The copy also records which skill versions ran.
+    fn skills_bundle(&self, role: &str) -> Result<Option<PathBuf>> {
+        let names = self.cfg.skills_for(role);
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let root = self.dir.join(format!("skills-{role}"));
+        let skills = root.join(".claude").join("skills");
+        if skills.exists() {
+            return Ok(Some(root)); // already built earlier in this run (fix-loop iteration)
+        }
+        for n in &names {
+            let src = self.cfg.skill_path(n)?;
+            copy_dir(&src, &skills.join(n)).with_context(|| format!("copying skill {n}"))?;
+        }
+        tracing::info!(role, skills = names.join(","), "skills attached");
+        Ok(Some(root))
     }
 
     /// MCP config handed to the QA agent: mobile-mcp for UI + our device server.
@@ -119,6 +142,21 @@ impl Run {
         std::fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
         Ok(path)
     }
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let to = dst.join(e.file_name());
+        // metadata() follows symlinks, so a linked file or folder is copied as its target.
+        if std::fs::metadata(e.path())?.is_dir() {
+            copy_dir(&e.path(), &to)?;
+        } else {
+            std::fs::copy(e.path(), &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Permission rules letting an agent write only inside the flows dir (absolute `//` form).

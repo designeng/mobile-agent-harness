@@ -103,14 +103,17 @@ async fn main() -> Result<()> {
         Cmd::Doctor { config } => doctor(&config).await,
         Cmd::Run { issue, config, pr } => {
             let cfg = config::Config::load(&config)?;
+            cfg.check_skills()?;
             pipeline::run_issue(cfg, issue, pr).await
         }
         Cmd::Queue { config, max_issues, budget_usd, no_pr, dry_run } => {
             let cfg = config::Config::load(&config)?;
+            cfg.check_skills()?;
             queue::run(cfg, queue::QueueOpts { max_issues, budget_usd, pr: !no_pr, dry_run }).await
         }
         Cmd::Explore { goal, config } => {
             let cfg = config::Config::load(&config)?;
+            cfg.check_skills()?;
             pipeline::explore(cfg, goal).await
         }
         Cmd::Status { run, last, json, config } => status::show(&config::Config::load(&config)?, run.as_deref(), last, json),
@@ -137,6 +140,10 @@ async fn doctor(config: &Path) -> Result<()> {
     check("config", cfg.as_ref().map(|c| format!("{} → app repo {}", config.display(), c.app.repo.display())).map_err(|e| anyhow::anyhow!("{e:#}")));
     if let Ok(c) = &cfg {
         check("app repo", shell::check("git", &["rev-parse", "--abbrev-ref", "HEAD"], &c.app.repo).await.map(|b| format!("git, on {b}")));
+        check(
+            "skills",
+            c.check_skills().map(|n| if n.is_empty() { "none configured".into() } else { format!("{} from {}", n.join(", "), c.skills.dir.display()) }),
+        );
     }
 
     let dev = device::Adb::resolve(&adb, serial.as_deref()).await;
