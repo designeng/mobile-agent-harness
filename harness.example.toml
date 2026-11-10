@@ -1,0 +1,24 @@
+# Copy to harness.toml and adjust.
+
+[app]
+repo = "../my-android-app"          # git repo of the app (relative to this file)
+package = "com.example.app"         # applicationId
+build = "./gradlew assembleDebug"   # run inside the task worktree
+apk = "app/build/outputs/apk/debug/app-debug.apk"
+unit_tests = "./gradlew testDebugUnitTest"
+flows_dir = ".maestro"              # Maestro regression flows, live in the app repo
+base_branch = "main"
+
+[device]
+# serial = "YDZT5DXCWGXG95G6"       # optional if exactly one device is connected
+adb = "adb"
+maestro = "~/.maestro/maestro/bin/maestro"
+
+[github]
+repo = "owner/my-android-app"       # issues are read from here, PRs opened here
+
+[agents]
+model = "claude-opus-5-5"           # developer + QA
+light_model = "claude-sonnet-5-5"   # planner + reviewer
+max_fix_iterations = 3
+mobile_mcp = ["npx", "-y", "@mobilenext/mobile-mcp@1.0.16"]
