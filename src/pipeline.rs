@@ -221,6 +221,7 @@ pub async fn run_issue(cfg: Config, issue_no: u64, open_pr: bool) -> Result<()> 
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let dir = cfg.state_dir().join("runs").join(format!("{ts}-issue-{issue_no}"));
     std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("run.pid"), std::process::id().to_string())?;
     let (worktree, branch) = prepare_worktree(&cfg, issue_no).await?;
     tracing::info!(run = %dir.display(), worktree = %worktree.display(), "run started");
     let adb = Adb::resolve(&cfg.device.adb, cfg.device.serial.as_deref()).await?;
@@ -367,6 +368,7 @@ pub async fn explore(cfg: Config, goal: String) -> Result<()> {
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let dir = cfg.state_dir().join("runs").join(format!("{ts}-explore"));
     std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("run.pid"), std::process::id().to_string())?;
     let adb = Adb::resolve(&cfg.device.adb, cfg.device.serial.as_deref()).await?;
     let worktree = cfg.app.repo.clone();
     let mut run = Run { cfg, dir, worktree, cost: 0.0 };

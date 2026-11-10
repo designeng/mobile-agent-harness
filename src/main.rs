@@ -5,6 +5,7 @@ mod github;
 mod mcp;
 mod pipeline;
 mod shell;
+mod status;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -36,6 +37,18 @@ enum Cmd {
     /// Exploratory QA of the installed app with a free-form goal (no code changes).
     Explore {
         goal: String,
+        #[arg(long, default_value = "harness.toml")]
+        config: PathBuf,
+    },
+    /// Show state of runs: stage, iteration, cost, QA/review verdicts.
+    Status {
+        /// Only runs whose directory name contains this (e.g. `issue-2`).
+        run: Option<String>,
+        /// How many most recent runs to show.
+        #[arg(long, default_value_t = 5)]
+        last: usize,
+        #[arg(long)]
+        json: bool,
         #[arg(long, default_value = "harness.toml")]
         config: PathBuf,
     },
@@ -77,6 +90,7 @@ async fn main() -> Result<()> {
             let cfg = config::Config::load(&config)?;
             pipeline::explore(cfg, goal).await
         }
+        Cmd::Status { run, last, json, config } => status::show(&config::Config::load(&config)?, run.as_deref(), last, json),
         Cmd::Mcp { serial, adb, maestro, package, apk, flows_dir, artifacts } => {
             mcp::serve(mcp::McpArgs { serial, adb, maestro, package, apk, flows_dir, artifacts }).await
         }
