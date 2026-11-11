@@ -25,6 +25,17 @@ pub struct AppCfg {
     pub repo: PathBuf,
     /// Application id, e.g. com.example.app
     pub package: String,
+    /// Optional slow setup before `build` (dependency install, native project generation).
+    /// Skipped while `prepare_inputs` are unchanged and `prepare_outputs` exist, so fix
+    /// iterations that only touch app code rebuild incrementally.
+    pub prepare: Option<String>,
+    /// Files/dirs (relative to the worktree) whose content decides whether `prepare` must rerun.
+    /// Empty = run `prepare` before every build.
+    #[serde(default)]
+    pub prepare_inputs: Vec<PathBuf>,
+    /// Files/dirs `prepare` creates; if any is missing, `prepare` runs regardless of inputs.
+    #[serde(default)]
+    pub prepare_outputs: Vec<PathBuf>,
     /// Build command, run inside the task worktree.
     pub build: String,
     /// APK path relative to the worktree root.

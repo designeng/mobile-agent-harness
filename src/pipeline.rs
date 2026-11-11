@@ -314,9 +314,31 @@ async fn gate_step(run: &Run, name: &str, cmd: &str) -> Result<shell::Out> {
     out
 }
 
-/// Deterministic gate: build + unit tests. Returns feedback for the developer on failure.
+/// Deterministic gate: (prepare) + build + unit tests. Returns feedback for the developer on failure.
 async fn gate(run: &Run) -> Result<Option<String>> {
     let cfg = &run.cfg;
+    if let Some(p) = &cfg.app.prepare {
+        let stamp = run.cfg.state_dir().join("stamps").join(format!(
+            "{}.prepare",
+            run.worktree.file_name().and_then(|n| n.to_str()).unwrap_or("worktree")
+        ));
+        let key = prepare_key(&run.worktree, p, &cfg.app.prepare_inputs)?;
+        let outputs_ok = cfg.app.prepare_outputs.iter().all(|o| run.worktree.join(o).exists());
+        let fresh = !cfg.app.prepare_inputs.is_empty() && outputs_ok && std::fs::read_to_string(&stamp).ok().as_deref() == Some(key.as_str());
+        if fresh {
+            tracing::info!("gate: prepare skipped (inputs unchanged)");
+            let stage = run.stage("prepare")?;
+            run.end(stage, true, None, Some("skipped: inputs unchanged"))?;
+        } else {
+            let _ = std::fs::remove_file(&stamp);
+            let o = gate_step(run, "prepare", p).await?;
+            if !o.ok {
+                return Ok(Some(format!("Build preparation FAILED (`{p}`):\n```\n{}\n```", o.tail(6000))));
+            }
+            std::fs::create_dir_all(stamp.parent().unwrap())?;
+            std::fs::write(&stamp, &key)?;
+        }
+    }
     let b = gate_step(run, "build", &cfg.app.build).await?;
     if !b.ok {
         return Ok(Some(format!("The build FAILED (`{}`):\n```\n{}\n```", cfg.app.build, b.tail(6000))));
@@ -334,6 +356,40 @@ async fn gate(run: &Run) -> Result<Option<String>> {
         return Ok(Some(msg));
     }
     Ok(None)
+}
+
+/// Content fingerprint of the prepare command and its inputs (files, or dirs walked
+/// recursively in sorted order; a missing input hashes as absent). FNV-1a: stable across builds.
+fn prepare_key(root: &Path, cmd: &str, inputs: &[PathBuf]) -> Result<String> {
+    fn feed(h: &mut u64, bytes: &[u8]) {
+        for b in bytes {
+            *h ^= *b as u64;
+            *h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    fn walk(h: &mut u64, root: &Path, rel: &Path) -> Result<()> {
+        let abs = root.join(rel);
+        feed(h, rel.to_string_lossy().as_bytes());
+        if abs.is_dir() {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(&abs)?.flatten().map(|e| rel.join(e.file_name())).collect();
+            entries.sort();
+            for e in entries {
+                walk(h, root, &e)?;
+            }
+        } else if abs.is_file() {
+            feed(h, &std::fs::read(&abs)?);
+        } else {
+            feed(h, b"<absent>");
+        }
+        feed(h, b"\0");
+        Ok(())
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    feed(&mut h, cmd.as_bytes());
+    for i in inputs {
+        walk(&mut h, root, i)?;
+    }
+    Ok(format!("{h:016x}"))
 }
 
 /// Runs every saved Maestro flow, one stage per flow. Returns failure descriptions.
@@ -442,12 +498,16 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool, resume: Option
     // Fail before planning/building (minutes + $) if the device will reject the APK anyway.
     adb.check_usb_install_allowed().await.map_err(|e| EnvError(format!("device: {e:#}")))?;
 
+    let build_cmd = match &run.cfg.app.prepare {
+        Some(p) => format!("{p} && {}", run.cfg.app.build),
+        None => run.cfg.app.build.clone(),
+    };
     let contract = format!(
         "\n# Build contract (the harness enforces this)\n\
          - Build gate — the harness runs it from the repo root right after you finish and sends you any errors; \
          do NOT run it yourself: `{}`\n- APK expected at: `{}`\n- Unit tests: `{}`\n\
          - Must run on a real device WITHOUT a dev server (JS bundle embedded in the APK).\n",
-        run.cfg.app.build,
+        build_cmd,
         run.cfg.app.apk.display(),
         run.cfg.app.unit_tests.as_deref().unwrap_or("(none)")
     );
@@ -761,6 +821,26 @@ mod tests {
         // Older checkpoints without optional fields still load.
         let old: Checkpoint = serde_json::from_value(json!({"iter": 1, "step": "gate"})).unwrap();
         assert_eq!(old.step, Step::Gate);
+    }
+
+    #[test]
+    fn prepare_key_tracks_input_content() {
+        let dir = std::env::temp_dir().join(format!("harness-pk-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("package.json"), "{}").unwrap();
+        std::fs::write(dir.join("assets/icon.png"), "a").unwrap();
+        let inputs = vec![PathBuf::from("package.json"), PathBuf::from("assets"), PathBuf::from("app.config.ts")];
+        let k1 = prepare_key(&dir, "npm ci", &inputs).unwrap();
+        assert_eq!(k1, prepare_key(&dir, "npm ci", &inputs).unwrap());
+        std::fs::write(dir.join("src.ts"), "not an input").unwrap();
+        assert_eq!(k1, prepare_key(&dir, "npm ci", &inputs).unwrap());
+        assert_ne!(k1, prepare_key(&dir, "npm install", &inputs).unwrap());
+        std::fs::write(dir.join("assets/icon.png"), "b").unwrap();
+        let k2 = prepare_key(&dir, "npm ci", &inputs).unwrap();
+        assert_ne!(k1, k2);
+        std::fs::write(dir.join("app.config.ts"), "x").unwrap();
+        assert_ne!(k2, prepare_key(&dir, "npm ci", &inputs).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

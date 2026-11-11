@@ -132,6 +132,7 @@ fn stage_label(name: &str) -> &str {
     match name {
         "planner" => "planning",
         "developer" => "developing",
+        "prepare" => "build prepare",
         "build" => "build gate",
         "unit" => "unit tests",
         "apk" => "apk check",

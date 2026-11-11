@@ -4,6 +4,11 @@
 repo = "../my-android-app"          # git repo of the app (relative to this file)
 package = "com.example.app"         # applicationId
 build = "./gradlew assembleDebug"   # run inside the task worktree
+# Optional slow setup before build, skipped while inputs are unchanged (e.g. Expo/React Native):
+# prepare = "npm ci && npx expo prebuild --platform android --no-install"
+# prepare_inputs = ["package.json", "package-lock.json", "app.json", "assets"]
+# prepare_outputs = ["node_modules", "android"]
+# build = "cd android && ./gradlew assembleRelease --build-cache"
 apk = "app/build/outputs/apk/debug/app-debug.apk"
 unit_tests = "./gradlew testDebugUnitTest"
 flows_dir = ".maestro"              # Maestro regression flows, live in the app repo
