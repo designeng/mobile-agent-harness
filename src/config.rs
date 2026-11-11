@@ -72,6 +72,9 @@ pub struct AgentsCfg {
     pub light_model: Option<String>,
     #[serde(default = "d_iters")]
     pub max_fix_iterations: u32,
+    /// A single agent session is killed after this many minutes (a hung CLI must not stall the queue).
+    #[serde(default = "d_agent_timeout")]
+    pub agent_timeout_min: u64,
     /// Command (argv) that launches mobile-mcp.
     #[serde(default = "d_mobile_mcp")]
     pub mobile_mcp: Vec<String>,
@@ -164,7 +167,7 @@ impl Default for DeviceCfg {
 
 impl Default for AgentsCfg {
     fn default() -> Self {
-        Self { model: None, light_model: None, max_fix_iterations: d_iters(), mobile_mcp: d_mobile_mcp(), by_complexity: Default::default() }
+        Self { model: None, light_model: None, max_fix_iterations: d_iters(), agent_timeout_min: d_agent_timeout(), mobile_mcp: d_mobile_mcp(), by_complexity: Default::default() }
     }
 }
 
@@ -173,6 +176,7 @@ fn d_branch() -> String { "main".into() }
 fn d_adb() -> String { "adb".into() }
 fn d_maestro() -> String { "~/.maestro/maestro/bin/maestro".into() }
 fn d_iters() -> u32 { 3 }
+fn d_agent_timeout() -> u64 { 60 }
 fn d_ready_label() -> String { "agent-ready".into() }
 fn d_max_failures() -> u32 { 2 }
 fn d_skills_dir() -> PathBuf { "skills".into() }

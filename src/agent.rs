@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -15,6 +16,10 @@ pub struct AgentSpec {
     pub model: Option<String>,
     /// `--effort` (low … max); None = the CLI/model default.
     pub effort: Option<String>,
+    /// Built-in tools the session gets at all (`--tools`); `Some(vec![])` = none.
+    /// Unlike `allowed_tools` (permissions only), this keeps unused tool definitions
+    /// (~20k tokens) out of every request. MCP tools are not affected.
+    pub tools: Option<Vec<String>>,
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
     pub mcp_config: Option<PathBuf>,
@@ -28,6 +33,8 @@ pub struct AgentSpec {
     pub session_id: Option<String>,
     /// Continue this earlier session instead of starting a new one; `prompt` is the next user turn.
     pub resume: Option<String>,
+    /// The session is killed (and the call fails) after this long.
+    pub timeout: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -56,6 +63,7 @@ impl AgentSpec {
             cwd: cwd.to_path_buf(),
             model: None,
             effort: None,
+            tools: None,
             allowed_tools: vec![],
             disallowed_tools: vec![],
             mcp_config: None,
@@ -64,6 +72,7 @@ impl AgentSpec {
             persist_session: false,
             session_id: None,
             resume: None,
+            timeout: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -102,6 +111,9 @@ pub async fn run(spec: AgentSpec, log: &Path) -> Result<AgentResult> {
     if let Some(e) = &spec.effort {
         cmd.args(["--effort", e]);
     }
+    if let Some(t) = &spec.tools {
+        cmd.arg("--tools").arg(t.join(","));
+    }
     if !spec.allowed_tools.is_empty() {
         cmd.arg("--allowedTools").args(&spec.allowed_tools);
     }
@@ -125,32 +137,57 @@ pub async fn run(spec: AgentSpec, log: &Path) -> Result<AgentResult> {
     stdin.write_all(spec.prompt.as_bytes()).await?;
     drop(stdin);
 
+    // Drain stderr concurrently: read only after stdout closes, a chatty stderr would fill
+    // the pipe buffer and block the CLI forever. Keep the tail for error messages.
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = stderr.read(&mut chunk).await {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > 64 * 1024 {
+                buf.drain(..buf.len() - 16 * 1024);
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
     let mut log_file = tokio::fs::File::create(log).await?;
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let mut result: Option<Value> = None;
     let mut model: Option<String> = None;
     let mut session_id: Option<String> = None;
-    while let Some(line) = lines.next_line().await? {
-        log_file.write_all(line.as_bytes()).await?;
-        log_file.write_all(b"\n").await?;
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-        match v["type"].as_str() {
-            Some("system") if v["subtype"] == "init" => {
-                model = v["model"].as_str().map(String::from);
-                session_id = v["session_id"].as_str().map(String::from);
+    let read = async {
+        while let Some(line) = lines.next_line().await? {
+            log_file.write_all(line.as_bytes()).await?;
+            log_file.write_all(b"\n").await?;
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            match v["type"].as_str() {
+                Some("system") if v["subtype"] == "init" => {
+                    model = v["model"].as_str().map(String::from);
+                    session_id = v["session_id"].as_str().map(String::from);
+                }
+                Some("assistant") => log_progress(spec.role, &v),
+                Some("result") => result = Some(v),
+                _ => {}
             }
-            Some("assistant") => log_progress(spec.role, &v),
-            Some("result") => result = Some(v),
-            _ => {}
+        }
+        anyhow::Ok(())
+    };
+    match tokio::time::timeout(spec.timeout, read).await {
+        Ok(r) => r?,
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!("{} agent timed out after {} min", spec.role, spec.timeout.as_secs() / 60);
         }
     }
     let status = child.wait().await?;
+    let err = stderr_task.await.unwrap_or_default();
     let Some(res) = result else {
-        let mut err = String::new();
-        if let Some(mut e) = child.stderr.take() {
-            use tokio::io::AsyncReadExt;
-            let _ = e.read_to_string(&mut err).await;
-        }
         bail!("{} agent exited ({status}) without a result: {}", spec.role, err.trim());
     };
     let cost = res["total_cost_usd"].as_f64().unwrap_or(0.0);

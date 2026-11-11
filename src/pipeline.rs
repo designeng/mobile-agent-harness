@@ -93,7 +93,11 @@ impl Run {
         let role = spec.role;
         if let Some(dir) = self.skills_bundle(role)? {
             spec.add_dirs.push(dir);
+            if let Some(t) = spec.tools.as_mut().filter(|t| !t.iter().any(|x| x == "Skill")) {
+                t.push("Skill".into());
+            }
         }
+        spec.timeout = Duration::from_secs(self.cfg.agents.agent_timeout_min * 60);
         let path = unique_path(&self.dir, log);
         let stage = self.stage(role)?;
         let session = spec.resume.as_deref().or(spec.session_id.as_deref());
@@ -204,9 +208,11 @@ fn plan_schema() -> Value {
                 "description": "User-level scenarios to verify on the device"},
             "complexity": {"type": "string", "enum": ["S", "M", "L"],
                 "description": "S: small, local change following existing patterns; M: several files or a new screen/module; L: new native dependency, architecture or cross-cutting change, or high risk"},
-            "complexity_reason": {"type": "string"}
+            "complexity_reason": {"type": "string"},
+            "missing_prerequisite": {"type": "string",
+                "description": "Empty if the code this issue builds on is on this branch. Otherwise what is missing (e.g. a screen or module from another, not yet merged issue)."}
         },
-        "required": ["summary", "steps", "acceptance_criteria", "qa_scenarios", "complexity", "complexity_reason"]
+        "required": ["summary", "steps", "acceptance_criteria", "qa_scenarios", "complexity", "complexity_reason", "missing_prerequisite"]
     })
 }
 
@@ -319,8 +325,9 @@ async fn gate_step(run: &Run, name: &str, cmd: &str) -> Result<shell::Out> {
     out
 }
 
-/// Deterministic gate: (prepare) + build + unit tests. Returns feedback for the developer on failure.
-async fn gate(run: &Run) -> Result<Option<String>> {
+/// Runs `prepare` unless its inputs are unchanged since the last success (stamp file).
+/// Returns failure feedback for the developer.
+async fn ensure_prepared(run: &Run) -> Result<Option<String>> {
     let cfg = &run.cfg;
     if let Some(p) = &cfg.app.prepare {
         let stamp = run.cfg.state_dir().join("stamps").join(format!(
@@ -343,6 +350,15 @@ async fn gate(run: &Run) -> Result<Option<String>> {
             std::fs::create_dir_all(stamp.parent().unwrap())?;
             std::fs::write(&stamp, &key)?;
         }
+    }
+    Ok(None)
+}
+
+/// Deterministic gate: (prepare) + build + unit tests. Returns feedback for the developer on failure.
+async fn gate(run: &Run) -> Result<Option<String>> {
+    let cfg = &run.cfg;
+    if let Some(f) = ensure_prepared(run).await? {
+        return Ok(Some(f));
     }
     let b = gate_step(run, "build", &cfg.app.build).await?;
     if !b.ok {
@@ -397,8 +413,15 @@ fn prepare_key(root: &Path, cmd: &str, inputs: &[PathBuf]) -> Result<String> {
     Ok(format!("{h:016x}"))
 }
 
-/// Runs every saved Maestro flow, one stage per flow. Returns failure descriptions.
-async fn regression(run: &Run, adb: &Adb) -> Result<Vec<String>> {
+struct Regression {
+    /// File names of flows that passed.
+    passed: Vec<String>,
+    /// Failure descriptions.
+    failed: Vec<String>,
+}
+
+/// Runs every saved Maestro flow, one stage per flow.
+async fn regression(run: &Run, adb: &Adb) -> Result<Regression> {
     let flows = run.worktree.join(&run.cfg.app.flows_dir);
     let mut files: Vec<PathBuf> = std::fs::read_dir(&flows)
         .into_iter()
@@ -408,18 +431,57 @@ async fn regression(run: &Run, adb: &Adb) -> Result<Vec<String>> {
         .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yaml" | "yml")))
         .collect();
     files.sort();
-    let mut fails = vec![];
+    let mut reg = Regression { passed: vec![], failed: vec![] };
     for f in files {
         tracing::info!("regression: {}", f.display());
         let stage = run.stage("regression")?;
         let res = mcp::run_maestro(adb, &run.cfg.device.maestro, &f, &run.dir).await;
         let flow = f.display().to_string();
         run.end(stage, res.is_ok(), None, Some(&flow))?;
-        if let Err(e) = res {
-            fails.push(format!("Regression flow {flow} failed:\n{e}"));
+        match res {
+            Ok(_) => reg.passed.push(f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(flow)),
+            Err(e) => reg.failed.push(format!("Regression flow {flow} failed:\n{e}")),
         }
     }
-    Ok(fails)
+    Ok(reg)
+}
+
+/// Built-in tools for QA/explore (device and UI tools come from MCP; ToolSearch loads deferred MCP tools).
+fn qa_tools() -> Option<Vec<String>> {
+    Some(["Read", "Glob", "Grep", "Write", "Edit", "ToolSearch"].map(String::from).to_vec())
+}
+
+/// Prompt section for a repeat QA: what passed last time and is still covered by passing flows,
+/// so the agent re-tests only what failed instead of the whole plan.
+fn render_qa_recheck(prev: &Value, passed_flows: &[String]) -> String {
+    let mut s = String::from(
+        "\n# Re-test after a fix — focus\nThe previous QA iteration failed; the developer has changed the code since. \
+         Re-test the failed criteria and reported bugs below, in depth. Criteria that passed last time: do not re-run them \
+         manually when a passing regression flow covers them — cite that flow as evidence; otherwise give them one quick check. \
+         Still report every acceptance criterion in `criteria`.\n",
+    );
+    let crit = |met: bool| prev["criteria"].as_array().into_iter().flatten().filter(move |c| c["met"] == met);
+    let failed: Vec<_> = crit(false).collect();
+    if !failed.is_empty() {
+        s.push_str("\nFailed last time:\n");
+        for c in failed {
+            let _ = writeln!(s, "- {}", c["criterion"].as_str().unwrap_or(""));
+        }
+    }
+    for b in prev["bugs"].as_array().into_iter().flatten() {
+        let _ = writeln!(s, "- Bug: {}", b["title"].as_str().unwrap_or(""));
+    }
+    let met: Vec<_> = crit(true).collect();
+    if !met.is_empty() {
+        s.push_str("\nPassed last time:\n");
+        for c in met {
+            let _ = writeln!(s, "- {} — {}", c["criterion"].as_str().unwrap_or(""), c["evidence"].as_str().unwrap_or(""));
+        }
+    }
+    if !passed_flows.is_empty() {
+        let _ = writeln!(s, "\nRegression flows that PASSED on this build: {}", passed_flows.join(", "));
+    }
+    s
 }
 
 /// Where an issue run stands; saved after every step so a stopped run continues from
@@ -444,6 +506,9 @@ struct Checkpoint {
     /// Planner's rating (S/M/L); picks model/effort per role via `[agents.by_complexity]`.
     #[serde(default)]
     complexity: Option<String>,
+    /// QA result of the last failed iteration: the next QA re-checks only what failed.
+    #[serde(default)]
+    last_qa: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -459,7 +524,7 @@ enum Step {
 
 impl Checkpoint {
     fn new() -> Self {
-        Checkpoint { iter: 1, step: Step::Develop, feedback: None, dev_session: None, dev_running: false, review: None, complexity: None }
+        Checkpoint { iter: 1, step: Step::Develop, feedback: None, dev_session: None, dev_running: false, review: None, complexity: None, last_qa: None }
     }
 
     /// Back to the developer with feedback.
@@ -513,7 +578,9 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool, resume: Option
     let contract = format!(
         "\n# Build contract (the harness enforces this)\n\
          - Build gate — the harness runs it from the repo root right after you finish and sends you any errors; \
-         do NOT run it yourself: `{}`\n- APK expected at: `{}`\n- Unit tests: `{}`\n\
+         do NOT run it yourself: `{}`\n- Dependencies are already installed by the harness (`prepare`); \
+         add new ones with the package manager's add/install command, do not reinstall everything.\n\
+         - APK expected at: `{}`\n- Unit tests: `{}`\n\
          - Must run on a real device WITHOUT a dev server (JS bundle embedded in the APK).\n",
         build_cmd,
         run.cfg.app.apk.display(),
@@ -526,9 +593,14 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool, resume: Option
         None => {
             let mut spec = AgentSpec::new("planner", PLANNER, format!("{issue_md}\n{contract}\nProduce the plan."), &run.worktree);
             spec.model = run.cfg.light_model().map(String::from);
+            spec.tools = Some(["Read", "Glob", "Grep", "Bash"].map(String::from).to_vec());
             spec.allowed_tools = vec!["Read".into(), "Glob".into(), "Grep".into()];
             spec.json_schema = Some(plan_schema());
             let plan = run.agent(spec, "planner.jsonl").await?.structured.context("planner returned no plan")?;
+            if let Some(m) = plan["missing_prerequisite"].as_str().map(str::trim).filter(|m| !m.is_empty()) {
+                run.db.set_plan(run.id, &plan, &render_plan(&plan))?;
+                anyhow::bail!("blocked: prerequisite not on the base branch yet — {m}. Merge it first, then retry this issue.");
+            }
             let plan_md = render_plan(&plan);
             run.db.set_plan(run.id, &plan, &plan_md)?;
             let mut cp = Checkpoint::new();
@@ -554,6 +626,11 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool, resume: Option
             // 2. Develop
             Step::Develop => {
                 tracing::info!(iter = cp.iter, "iteration");
+                // Dependencies in place before the developer starts, so it doesn't spend turns
+                // (and a full reinstall) on it. A failure here goes on to the gate's feedback.
+                if let Some(f) = ensure_prepared(run).await? {
+                    tracing::warn!("prepare before developer failed: {}", f.lines().next().unwrap_or(""));
+                }
                 develop(run, &mut cp, &issue_md, &plan_md, &contract).await?;
                 wip_commit(run, &format!("wip: issue #{issue_no} iteration {} (developer)", cp.iter)).await?;
                 cp.step = Step::Gate;
@@ -581,17 +658,21 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool, resume: Option
                         // something the developer agent can fix — don't burn an iteration on it.
                         return Err(EnvError(format!("APK install failed on the device (environment problem):\n{}", inst.tail(3000))).into());
                     }
-                    let reg_fails = regression(run, &adb).await?;
+                    let reg = regression(run, &adb).await?;
                     let _ = adb.logcat_clear().await;
                     let mut prompt = format!(
                         "{issue_md}\n\n# Plan\n{plan_md}\n\nThe new build is already installed. \
                          Save Maestro flows into `{flows_rel}/`.\n"
                     );
-                    if !reg_fails.is_empty() {
-                        let _ = write!(prompt, "\n# Saved regression flows that failed on this build\n{}\n", reg_fails.join("\n\n"));
+                    if let Some(prev) = &cp.last_qa {
+                        prompt.push_str(&render_qa_recheck(prev, &reg.passed));
+                    }
+                    if !reg.failed.is_empty() {
+                        let _ = write!(prompt, "\n# Saved regression flows that failed on this build\n{}\n", reg.failed.join("\n\n"));
                     }
                     let mut spec = AgentSpec::new("qa", QA, prompt, &run.worktree);
                     (spec.model, spec.effort) = run.cfg.role_model("qa", cp.complexity.as_deref());
+                    spec.tools = qa_tools();
                     spec.mcp_config = Some(mcp_cfg.clone());
                     spec.allowed_tools = [
                         "mcp__mobile".to_string(),
@@ -611,7 +692,10 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool, resume: Option
                 match qa["verdict"].as_str() {
                     Some("pass") => cp.step = Step::Review,
                     Some("blocked") => return Err(EnvError(format!("QA blocked (environment problem): {}", qa["notes"])).into()),
-                    _ => cp.retry(render_qa_feedback(&qa)),
+                    _ => {
+                        cp.retry(render_qa_feedback(&qa));
+                        cp.last_qa = Some(qa);
+                    }
                 }
             }
 
@@ -628,6 +712,7 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool, resume: Option
                     &run.worktree,
                 );
                 (spec.model, spec.effort) = run.cfg.role_model("reviewer", cp.complexity.as_deref());
+                spec.tools = Some(["Read", "Glob", "Grep", "Bash"].map(String::from).to_vec());
                 spec.allowed_tools = ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git status:*)", "Bash(git log:*)"]
                     .map(String::from)
                     .to_vec();
@@ -737,9 +822,15 @@ fn developer_spec(run: &Run, prompt: String, complexity: Option<&str>) -> AgentS
     let mut spec = AgentSpec::new("developer", DEVELOPER, prompt, &run.worktree);
     (spec.model, spec.effort) = run.cfg.role_model("developer", complexity);
     spec.persist_session = true;
-    spec.allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash"].map(String::from).to_vec();
+    spec.tools = Some(["Read", "Edit", "Write", "Glob", "Grep", "Bash", "TaskStop"].map(String::from).to_vec());
+    spec.allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash", "TaskStop"].map(String::from).to_vec();
+    // Deny rules also match inside compound commands (`cd android && ./gradlew …`).
     spec.disallowed_tools = [
         "Bash(git push:*)", "Bash(git commit:*)", "Bash(git reset:*)", "Bash(git checkout:*)",
+        // Other branches (e.g. an unmerged issue) must not leak into this one.
+        "Bash(git merge:*)", "Bash(git rebase:*)", "Bash(git cherry-pick:*)", "Bash(git pull:*)",
+        // The harness builds (gate) and installs dependencies (prepare).
+        "Bash(./gradlew:*)", "Bash(gradle:*)", "Bash(npx expo prebuild:*)", "Bash(npm ci:*)",
         "Bash(adb:*)", "Bash(maestro:*)", "Bash(rm -rf:*)", "WebFetch", "WebSearch",
     ]
     .map(String::from)
@@ -796,6 +887,7 @@ async fn explore_inner(run: &mut Run, goal: &str) -> Result<()> {
         &run.worktree,
     );
     spec.model = run.cfg.dev_model().map(String::from);
+    spec.tools = qa_tools();
     spec.mcp_config = Some(mcp_cfg);
     spec.allowed_tools = vec!["mcp__mobile".into(), "mcp__device".into(), "Read".into(), "Glob".into(), "Grep".into()];
     if goal.to_lowercase().contains("flow") {
@@ -851,6 +943,24 @@ mod tests {
         std::fs::write(dir.join("app.config.ts"), "x").unwrap();
         assert_ne!(k2, prepare_key(&dir, "npm ci", &inputs).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn qa_recheck_lists_failed_and_passed() {
+        let prev = json!({
+            "criteria": [
+                {"criterion": "Back returns home", "met": true, "evidence": "flow back.yaml"},
+                {"criterion": "No double screen", "met": false, "evidence": "two screens"}
+            ],
+            "bugs": [{"title": "Double tap opens twice"}]
+        });
+        let s = render_qa_recheck(&prev, &["back.yaml".into()]);
+        let failed = s.find("Failed last time").unwrap();
+        let passed = s.find("Passed last time").unwrap();
+        assert!(failed < passed);
+        assert!(s[failed..passed].contains("No double screen") && s[failed..passed].contains("Bug: Double tap opens twice"));
+        assert!(s[passed..].contains("Back returns home — flow back.yaml"));
+        assert!(s.contains("PASSED on this build: back.yaml"));
     }
 
     #[test]

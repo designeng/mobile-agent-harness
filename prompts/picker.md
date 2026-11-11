@@ -10,6 +10,7 @@ Order the issues you would run, best first:
 
 Put an issue in `skip` (with a short reason) when agents cannot finish it alone, e.g.:
 - needs a human decision (design, product choice, copy not given) or is too vague to verify;
+- builds on an issue listed as "not merged yet" (its code is not on the base branch); reason: "waits for #N";
 - needs secrets, accounts, paid services or backend changes outside this app repo;
 - cannot be verified on a phone (pure infra, store listing, analytics dashboards);
 - is really an epic or discussion, not a task.

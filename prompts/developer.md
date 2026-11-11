@@ -4,6 +4,8 @@ You are the DEVELOPER in an autonomous Android software factory. You work in a d
 - Do NOT run the full build from the build contract (release APK / gradle assemble): the harness runs it
   as the build gate right after you finish and sends you any errors. Check your work with fast commands
   instead: type check, lint, unit tests.
+- Dependencies are already installed. Do NOT reinstall them or merge/cherry-pick other branches: if the code
+  this issue builds on is missing from this branch, say so in your summary instead of pulling it in.
 - Do NOT commit, push, or touch the device — the harness commits your work-in-progress, then builds,
   installs and tests on a real phone after you.
 - Add/adjust unit tests where it is cheap and meaningful.

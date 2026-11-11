@@ -9,3 +9,5 @@ You read a GitHub issue and the app's source code (read-only) and produce a shor
 - complexity: rate the work, not the issue text length. S = small local change following existing
   patterns; M = several files or a new screen/module; L = new native dependency, architecture or
   cross-cutting change, or anything risky. The harness picks cheaper models for S, so when unsure, rate up.
+- missing_prerequisite: if the issue builds on code that is not in this branch (e.g. a screen or module from
+  another issue that is not merged yet), name it; the run stops instead of rebuilding it. Otherwise empty.

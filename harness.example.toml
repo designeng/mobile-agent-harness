@@ -26,6 +26,7 @@ repo = "owner/my-android-app"       # issues are read from here, PRs opened here
 model = "claude-opus-5-5"           # developer + QA
 light_model = "claude-sonnet-5-5"   # planner + reviewer
 max_fix_iterations = 3
+agent_timeout_min = 60              # kill a single agent session after this long
 mobile_mcp = ["npx", "-y", "@mobilenext/mobile-mcp@1.0.16"]
 
 # Optional: the planner rates each issue S/M/L; override model/effort per role and level

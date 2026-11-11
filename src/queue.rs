@@ -87,7 +87,7 @@ pub async fn run(cfg: Config, opts: QueueOpts) -> Result<()> {
         let pick = if cands.len() == 1 {
             Pick { order: vec![(cands[0].number, "only candidate".into())], skip: vec![] }
         } else {
-            pick(&cfg, &cands).await?
+            pick(&cfg, &cands, &unmerged(&all)).await?
         };
         for (n, why) in &pick.skip {
             tracing::info!(issue = n, "picker skipped: {why}");
@@ -212,9 +212,22 @@ fn pick_schema() -> Value {
     })
 }
 
+/// Open issues whose work is not on the base branch yet: done by the harness (PR awaiting merge)
+/// or in progress. Candidates building on them must wait, even without a "Depends on #N" line.
+fn unmerged(all: &[ListedIssue]) -> Vec<&ListedIssue> {
+    all.iter().filter(|i| i.has_label(DONE) || i.has_label(IN_PROGRESS)).collect()
+}
+
 /// One light-model call that orders the candidates; recorded as a `pick` run (cost shows in status).
-async fn pick(cfg: &Config, cands: &[&ListedIssue]) -> Result<Pick> {
+async fn pick(cfg: &Config, cands: &[&ListedIssue], unmerged: &[&ListedIssue]) -> Result<Pick> {
     let mut list = String::new();
+    if !unmerged.is_empty() {
+        list.push_str("\n# Not merged into the base branch yet (not candidates)\n");
+        for i in unmerged {
+            let _ = writeln!(list, "- #{} {}", i.number, i.title);
+        }
+        list.push_str("\n# Candidates\n");
+    }
     for i in cands {
         let labels: Vec<&str> = i.labels.iter().map(|l| l.name.as_str()).collect();
         let _ = write!(list, "\n## #{} {}\nlabels: {}\n\n{}\n", i.number, i.title, labels.join(", "), truncate(i.body.trim(), BODY_CHARS));
@@ -223,7 +236,7 @@ async fn pick(cfg: &Config, cands: &[&ListedIssue]) -> Result<Pick> {
     let res = async {
         let mut spec = AgentSpec::new("picker", PICKER, format!("# Candidate issues\n{list}"), &cfg.app.repo);
         spec.model = cfg.light_model().map(String::from);
-        spec.disallowed_tools = ["Bash", "Edit", "Write", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "Task"].map(String::from).to_vec();
+        spec.tools = Some(vec![]); // decides from the list alone; no tool definitions in context
         spec.json_schema = Some(pick_schema());
         let v = run.agent(spec, "picker.jsonl").await?.structured.context("picker returned nothing")?;
         let known: HashSet<u64> = cands.iter().map(|i| i.number).collect();
@@ -282,5 +295,11 @@ mod tests {
         let skipped = HashSet::from([6]);
         let got: Vec<u64> = candidates(&all, "agent-ready", &skipped).iter().map(|i| i.number).collect();
         assert_eq!(got, vec![1, 3]);
+    }
+
+    #[test]
+    fn unmerged_are_done_or_in_progress() {
+        let all = vec![issue(1, "", &[DONE]), issue(2, "", &[IN_PROGRESS]), issue(3, "", &["agent-ready"]), issue(4, "", &[FAILED])];
+        assert_eq!(unmerged(&all).iter().map(|i| i.number).collect::<Vec<_>>(), vec![1, 2]);
     }
 }
