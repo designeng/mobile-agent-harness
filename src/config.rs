@@ -75,7 +75,31 @@ pub struct AgentsCfg {
     /// Command (argv) that launches mobile-mcp.
     #[serde(default = "d_mobile_mcp")]
     pub mobile_mcp: Vec<String>,
+    /// Per-complexity overrides (the planner rates each issue S, M or L), e.g.
+    /// `[agents.by_complexity.S] developer = { model = "claude-sonnet-5-5", effort = "low" }`.
+    #[serde(default)]
+    pub by_complexity: std::collections::BTreeMap<String, ComplexityCfg>,
 }
+
+/// Model/effort overrides for one complexity level; roles without an entry use the defaults.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComplexityCfg {
+    pub developer: Option<RoleCfg>,
+    pub qa: Option<RoleCfg>,
+    pub reviewer: Option<RoleCfg>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleCfg {
+    pub model: Option<String>,
+    /// `claude --effort`: low | medium | high | xhigh | max.
+    pub effort: Option<String>,
+}
+
+pub const COMPLEXITIES: [&str; 3] = ["S", "M", "L"];
+const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct QueueCfg {
@@ -140,7 +164,7 @@ impl Default for DeviceCfg {
 
 impl Default for AgentsCfg {
     fn default() -> Self {
-        Self { model: None, light_model: None, max_fix_iterations: d_iters(), mobile_mcp: d_mobile_mcp() }
+        Self { model: None, light_model: None, max_fix_iterations: d_iters(), mobile_mcp: d_mobile_mcp(), by_complexity: Default::default() }
     }
 }
 
@@ -176,7 +200,34 @@ impl Config {
         if cfg.skills.dir.is_relative() {
             cfg.skills.dir = cfg.base_dir.join(&cfg.skills.dir);
         }
+        for (level, c) in &cfg.agents.by_complexity {
+            anyhow::ensure!(COMPLEXITIES.contains(&level.as_str()), "agents.by_complexity.{level}: expected one of {COMPLEXITIES:?}");
+            for r in [&c.developer, &c.qa, &c.reviewer].into_iter().flatten() {
+                if let Some(e) = &r.effort {
+                    anyhow::ensure!(EFFORTS.contains(&e.as_str()), "agents.by_complexity.{level}: effort {e:?} not one of {EFFORTS:?}");
+                }
+            }
+        }
         Ok(cfg)
+    }
+
+    /// (model, effort) for a role on an issue of this complexity: the complexity override
+    /// if configured, else the role's default model and the CLI's default effort.
+    pub fn role_model(&self, role: &str, complexity: Option<&str>) -> (Option<String>, Option<String>) {
+        let default = match role {
+            "reviewer" | "planner" | "picker" => self.light_model(),
+            _ => self.dev_model(),
+        };
+        let o = complexity.and_then(|c| self.agents.by_complexity.get(c)).and_then(|c| match role {
+            "developer" => c.developer.as_ref(),
+            "qa" => c.qa.as_ref(),
+            "reviewer" => c.reviewer.as_ref(),
+            _ => None,
+        });
+        (
+            o.and_then(|r| r.model.clone()).or(default.map(String::from)),
+            o.and_then(|r| r.effort.clone()),
+        )
     }
 
     /// State dir for worktrees and run artifacts.
@@ -236,5 +287,39 @@ impl Config {
         let p = self.skills.dir.join(name);
         anyhow::ensure!(p.join("SKILL.md").is_file(), "skill {name:?}: no {}", p.join("SKILL.md").display());
         Ok(p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(extra: &str) -> Result<Config> {
+        let dir = std::env::temp_dir().join(format!("harness-cfg-{}-{}", std::process::id(), extra.len()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("harness.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[app]\nrepo = \".\"\npackage = \"a.b\"\nbuild = \"true\"\napk = \"a.apk\"\n\
+                 [github]\nrepo = \"o/r\"\n[agents]\nmodel = \"opus\"\nlight_model = \"sonnet\"\n{extra}"
+            ),
+        )?;
+        Config::load(&path)
+    }
+
+    #[test]
+    fn role_model_by_complexity() -> Result<()> {
+        let c = cfg("[agents.by_complexity.S]\ndeveloper = { model = \"sonnet\", effort = \"low\" }\n\
+                     [agents.by_complexity.L]\ndeveloper = { effort = \"high\" }\n")?;
+        assert_eq!(c.role_model("developer", Some("S")), (Some("sonnet".into()), Some("low".into())));
+        assert_eq!(c.role_model("qa", Some("S")), (Some("opus".into()), None), "no qa override: defaults");
+        assert_eq!(c.role_model("developer", Some("L")), (Some("opus".into()), Some("high".into())));
+        assert_eq!(c.role_model("developer", Some("M")), (Some("opus".into()), None));
+        assert_eq!(c.role_model("developer", None), (Some("opus".into()), None));
+        assert_eq!(c.role_model("reviewer", Some("S")), (Some("sonnet".into()), None));
+        assert!(cfg("[agents.by_complexity.XL]\n").is_err());
+        assert!(cfg("[agents.by_complexity.S]\nqa = { effort = \"turbo\" }\n").is_err());
+        Ok(())
     }
 }

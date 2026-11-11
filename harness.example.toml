@@ -28,6 +28,13 @@ light_model = "claude-sonnet-5-5"   # planner + reviewer
 max_fix_iterations = 3
 mobile_mcp = ["npx", "-y", "@mobilenext/mobile-mcp@1.0.16"]
 
+# Optional: the planner rates each issue S/M/L; override model/effort per role and level
+# (roles: developer, qa, reviewer; effort: low|medium|high|xhigh|max).
+# [agents.by_complexity.S]
+# developer = { model = "claude-sonnet-5-5" }
+# [agents.by_complexity.L]
+# developer = { effort = "high" }
+
 [skills]
 # Claude Code skills (folders with SKILL.md) handed to agents per role.
 # Each name is a folder in `dir`; it is copied into the run dir and attached via --add-dir.

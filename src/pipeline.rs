@@ -201,9 +201,12 @@ fn plan_schema() -> Value {
             "steps": {"type": "array", "items": {"type": "string"}},
             "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
             "qa_scenarios": {"type": "array", "items": {"type": "string"},
-                "description": "User-level scenarios to verify on the device"}
+                "description": "User-level scenarios to verify on the device"},
+            "complexity": {"type": "string", "enum": ["S", "M", "L"],
+                "description": "S: small, local change following existing patterns; M: several files or a new screen/module; L: new native dependency, architecture or cross-cutting change, or high risk"},
+            "complexity_reason": {"type": "string"}
         },
-        "required": ["summary", "steps", "acceptance_criteria", "qa_scenarios"]
+        "required": ["summary", "steps", "acceptance_criteria", "qa_scenarios", "complexity", "complexity_reason"]
     })
 }
 
@@ -248,8 +251,10 @@ fn render_plan(p: &Value) -> String {
         p[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).map(|s| format!("- {s}\n")).collect::<String>()).unwrap_or_default()
     };
     format!(
-        "## Summary\n{}\n\n## Steps\n{}\n## Acceptance criteria\n{}\n## QA scenarios\n{}",
+        "## Summary\n{}\n\nComplexity: {} — {}\n\n## Steps\n{}\n## Acceptance criteria\n{}\n## QA scenarios\n{}",
         p["summary"].as_str().unwrap_or(""),
+        p["complexity"].as_str().unwrap_or("?"),
+        p["complexity_reason"].as_str().unwrap_or(""),
         list("steps"),
         list("acceptance_criteria"),
         list("qa_scenarios")
@@ -436,6 +441,9 @@ struct Checkpoint {
     /// Approved review (pr_title / pr_body), from `Commit` on.
     #[serde(default)]
     review: Option<Value>,
+    /// Planner's rating (S/M/L); picks model/effort per role via `[agents.by_complexity]`.
+    #[serde(default)]
+    complexity: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -451,7 +459,7 @@ enum Step {
 
 impl Checkpoint {
     fn new() -> Self {
-        Checkpoint { iter: 1, step: Step::Develop, feedback: None, dev_session: None, dev_running: false, review: None }
+        Checkpoint { iter: 1, step: Step::Develop, feedback: None, dev_session: None, dev_running: false, review: None, complexity: None }
     }
 
     /// Back to the developer with feedback.
@@ -523,7 +531,9 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool, resume: Option
             let plan = run.agent(spec, "planner.jsonl").await?.structured.context("planner returned no plan")?;
             let plan_md = render_plan(&plan);
             run.db.set_plan(run.id, &plan, &plan_md)?;
-            let cp = Checkpoint::new();
+            let mut cp = Checkpoint::new();
+            cp.complexity = plan["complexity"].as_str().map(String::from);
+            tracing::info!(complexity = cp.complexity.as_deref().unwrap_or("?"), "planned: {}", plan["complexity_reason"].as_str().unwrap_or(""));
             run.save(&cp)?;
             (plan_md, cp)
         }
@@ -581,7 +591,7 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool, resume: Option
                         let _ = write!(prompt, "\n# Saved regression flows that failed on this build\n{}\n", reg_fails.join("\n\n"));
                     }
                     let mut spec = AgentSpec::new("qa", QA, prompt, &run.worktree);
-                    spec.model = run.cfg.dev_model().map(String::from);
+                    (spec.model, spec.effort) = run.cfg.role_model("qa", cp.complexity.as_deref());
                     spec.mcp_config = Some(mcp_cfg.clone());
                     spec.allowed_tools = [
                         "mcp__mobile".to_string(),
@@ -617,7 +627,7 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool, resume: Option
                     ),
                     &run.worktree,
                 );
-                spec.model = run.cfg.light_model().map(String::from);
+                (spec.model, spec.effort) = run.cfg.role_model("reviewer", cp.complexity.as_deref());
                 spec.allowed_tools = ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git status:*)", "Bash(git log:*)"]
                     .map(String::from)
                     .to_vec();
@@ -693,7 +703,7 @@ async fn develop(run: &mut Run, cp: &mut Checkpoint, issue_md: &str, plan_md: &s
         };
         cp.dev_running = true;
         run.save(cp)?;
-        let mut spec = developer_spec(run, prompt);
+        let mut spec = developer_spec(run, prompt, cp.complexity.as_deref());
         spec.resume = Some(session.clone());
         let path = run.dir.join(&log);
         match run.agent(spec, &log).await {
@@ -711,7 +721,7 @@ async fn develop(run: &mut Run, cp: &mut Checkpoint, issue_md: &str, plan_md: &s
     if let Some(f) = &cp.feedback {
         let _ = write!(prompt, "\n# Feedback from the previous iteration — fix this\n{f}\n");
     }
-    let mut spec = developer_spec(run, prompt);
+    let mut spec = developer_spec(run, prompt, cp.complexity.as_deref());
     let id = agent::new_session_id()?;
     spec.session_id = Some(id.clone());
     cp.dev_session = Some(id.clone());
@@ -723,9 +733,9 @@ async fn develop(run: &mut Run, cp: &mut Checkpoint, issue_md: &str, plan_md: &s
     Ok(())
 }
 
-fn developer_spec(run: &Run, prompt: String) -> AgentSpec {
+fn developer_spec(run: &Run, prompt: String, complexity: Option<&str>) -> AgentSpec {
     let mut spec = AgentSpec::new("developer", DEVELOPER, prompt, &run.worktree);
-    spec.model = run.cfg.dev_model().map(String::from);
+    (spec.model, spec.effort) = run.cfg.role_model("developer", complexity);
     spec.persist_session = true;
     spec.allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash"].map(String::from).to_vec();
     spec.disallowed_tools = [

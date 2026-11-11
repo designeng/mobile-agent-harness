@@ -138,6 +138,7 @@ pub struct RunRow {
     pub summary: Option<String>,
     pub error: Option<String>,
     pub pr_url: Option<String>,
+    pub complexity: Option<String>,
     pub cost: f64,
     pub iter: u32,
     /// (name, iter, finished)
@@ -181,6 +182,13 @@ impl Db {
                  ALTER TABLE agent_calls ADD COLUMN session_id TEXT;",
             )?;
             tx.pragma_update(None, "user_version", 2)?;
+            tx.commit()?;
+        }
+        if version < 3 {
+            // v3: planner's complexity rating (S/M/L), to compare cost per finished issue by tier.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch("ALTER TABLE runs ADD COLUMN complexity TEXT;")?;
+            tx.pragma_update(None, "user_version", 3)?;
             tx.commit()?;
         }
         Ok(Db { conn })
@@ -276,7 +284,10 @@ impl Db {
     }
 
     pub fn set_plan(&self, run: i64, plan: &Value, plan_md: &str) -> Result<()> {
-        self.conn.execute("UPDATE runs SET plan_json = ?2, plan_md = ?3 WHERE id = ?1", params![run, plan.to_string(), plan_md])?;
+        self.conn.execute(
+            "UPDATE runs SET plan_json = ?2, plan_md = ?3, complexity = ?4 WHERE id = ?1",
+            params![run, plan.to_string(), plan_md, plan["complexity"].as_str()],
+        )?;
         Ok(())
     }
 
@@ -420,7 +431,7 @@ impl Db {
     pub fn recent_runs(&self, filter: Option<&str>, last: usize) -> Result<Vec<RunRow>> {
         let pattern = format!("%{}%", filter.unwrap_or(""));
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, status, pid, summary, error, pr_url,
+            "SELECT id, name, status, pid, summary, error, pr_url, complexity,
                     (SELECT COALESCE(SUM(cost_usd), 0) FROM agent_calls WHERE run_id = runs.id),
                     (SELECT COALESCE(MAX(iter), 0) FROM stages WHERE run_id = runs.id)
              FROM runs WHERE name LIKE ?1 ORDER BY id DESC LIMIT ?2",
@@ -435,8 +446,9 @@ impl Db {
                     summary: r.get(4)?,
                     error: r.get(5)?,
                     pr_url: r.get(6)?,
-                    cost: r.get(7)?,
-                    iter: r.get(8)?,
+                    complexity: r.get(7)?,
+                    cost: r.get(8)?,
+                    iter: r.get(9)?,
                     stage: None,
                     last_activity: None,
                     live_transcript: None,

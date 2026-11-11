@@ -112,6 +112,9 @@ fn info(r: RunRow) -> RunInfo {
     let idle = db_time.max(file_time).and_then(|t| t.elapsed().ok());
 
     let mut verdict = Vec::new();
+    if let Some(c) = &r.complexity {
+        verdict.push(format!("complexity: {c}"));
+    }
     if let Some((v, bugs)) = &r.qa {
         verdict.push(format!("QA: {v} ({bugs} bugs)"));
     }

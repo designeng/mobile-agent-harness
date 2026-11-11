@@ -13,6 +13,8 @@ pub struct AgentSpec {
     pub prompt: String,
     pub cwd: PathBuf,
     pub model: Option<String>,
+    /// `--effort` (low … max); None = the CLI/model default.
+    pub effort: Option<String>,
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
     pub mcp_config: Option<PathBuf>,
@@ -53,6 +55,7 @@ impl AgentSpec {
             prompt,
             cwd: cwd.to_path_buf(),
             model: None,
+            effort: None,
             allowed_tools: vec![],
             disallowed_tools: vec![],
             mcp_config: None,
@@ -96,6 +99,9 @@ pub async fn run(spec: AgentSpec, log: &Path) -> Result<AgentResult> {
     if let Some(m) = &spec.model {
         cmd.args(["--model", m]);
     }
+    if let Some(e) = &spec.effort {
+        cmd.args(["--effort", e]);
+    }
     if !spec.allowed_tools.is_empty() {
         cmd.arg("--allowedTools").args(&spec.allowed_tools);
     }
@@ -112,7 +118,7 @@ pub async fn run(spec: AgentSpec, log: &Path) -> Result<AgentResult> {
         cmd.args(["--json-schema", &s.to_string()]);
     }
 
-    tracing::info!(role = spec.role, "agent start");
+    tracing::info!(role = spec.role, model = spec.model.as_deref().unwrap_or("default"), effort = spec.effort.as_deref().unwrap_or("default"), "agent start");
     let mut child = cmd.spawn().context("spawning claude")?;
     // Prompt goes via stdin: avoids argv limits and option parsing surprises.
     let mut stdin = child.stdin.take().unwrap();
