@@ -1,5 +1,6 @@
 mod agent;
 mod config;
+mod dashboard;
 mod db;
 mod device;
 mod github;
@@ -75,6 +76,13 @@ enum Cmd {
         #[arg(long, default_value = "harness.toml")]
         config: PathBuf,
     },
+    /// Local web dashboard: issues on a board by harness state, run details, costs.
+    Dashboard {
+        #[arg(long, default_value_t = 7878)]
+        port: u16,
+        #[arg(long, default_value = "harness.toml")]
+        config: PathBuf,
+    },
     /// Device MCP server over stdio (spawned by agents, not by hand).
     Mcp {
         #[arg(long)]
@@ -121,6 +129,7 @@ async fn main() -> Result<()> {
             pipeline::explore(cfg, goal).await
         }
         Cmd::Status { run, last, json, config } => status::show(&config::Config::load(&config)?, run.as_deref(), last, json),
+        Cmd::Dashboard { port, config } => dashboard::serve(config::Config::load(&config)?, port).await,
         Cmd::Mcp { serial, adb, maestro, package, apk, flows_dir, artifacts } => {
             mcp::serve(mcp::McpArgs { serial, adb, maestro, package, apk, flows_dir, artifacts }).await
         }

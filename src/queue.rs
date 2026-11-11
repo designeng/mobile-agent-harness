@@ -16,11 +16,11 @@ use std::fmt::Write as _;
 
 const PICKER: &str = include_str!("../prompts/picker.md");
 
-const IN_PROGRESS: &str = "agent:in-progress";
-const DONE: &str = "agent:done";
-const FAILED: &str = "agent:failed";
+pub const IN_PROGRESS: &str = "agent:in-progress";
+pub const DONE: &str = "agent:done";
+pub const FAILED: &str = "agent:failed";
 /// Issues with any of these are never picked automatically.
-const EXCLUDED: [&str; 4] = [IN_PROGRESS, DONE, FAILED, "blocked"];
+pub const EXCLUDED: [&str; 4] = [IN_PROGRESS, DONE, FAILED, "blocked"];
 /// Issue body excerpt sent to the picker.
 const BODY_CHARS: usize = 1500;
 
@@ -181,7 +181,7 @@ fn candidates<'a>(all: &'a [ListedIssue], ready: &str, skipped: &HashSet<u64>) -
 }
 
 /// Issue numbers after "depends on" / "blocked by" (same line), e.g. "Depends on #3, #5".
-fn dependencies(body: &str) -> Vec<u64> {
+pub fn dependencies(body: &str) -> Vec<u64> {
     let mut out = vec![];
     for line in body.to_lowercase().lines() {
         for key in ["depends on", "blocked by"] {

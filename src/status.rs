@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::time::{Duration, SystemTime};
 
 #[derive(PartialEq, Clone, Copy)]
-enum State {
+pub enum State {
     Running,
     Done,
     Failed,
@@ -16,7 +16,7 @@ enum State {
 }
 
 impl State {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             State::Running => "RUNNING",
             State::Done => "DONE",
@@ -80,13 +80,7 @@ pub fn show(cfg: &Config, run: Option<&str>, last: usize, json: bool) -> Result<
 }
 
 fn info(r: RunRow) -> RunInfo {
-    let state = match r.status.as_str() {
-        "done" => State::Done,
-        "failed" => State::Failed,
-        "interrupted" => State::Interrupted,
-        _ if crate::shell::pid_alive(r.pid) => State::Running,
-        _ => State::Crashed,
-    };
+    let state = run_state(&r.status, r.pid);
     let mut stage = match (&r.stage, state) {
         (_, State::Done) => "finished".to_string(),
         (None, _) => "starting".to_string(),
@@ -131,7 +125,18 @@ fn info(r: RunRow) -> RunInfo {
     RunInfo { name: r.name, state, stage, iter: r.iter, cost: r.cost, idle, verdict: verdict.join(" | "), head }
 }
 
-fn stage_label(name: &str) -> &str {
+/// A run's state; a `running` row whose process is gone is crashed.
+pub fn run_state(status: &str, pid: u32) -> State {
+    match status {
+        "done" => State::Done,
+        "failed" => State::Failed,
+        "interrupted" => State::Interrupted,
+        _ if crate::shell::pid_alive(pid) => State::Running,
+        _ => State::Crashed,
+    }
+}
+
+pub fn stage_label(name: &str) -> &str {
     match name {
         "planner" => "planning",
         "developer" => "developing",

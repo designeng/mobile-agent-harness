@@ -1,6 +1,6 @@
 HARNESS ?= cargo run -q --
 
-.PHONY: build doctor status status-json queue queue-plan
+.PHONY: build doctor status status-json queue queue-plan dashboard
 
 build:
 	cargo build
@@ -22,3 +22,7 @@ queue:
 # Show which issues the queue would run, in what order (one cheap picker call).
 queue-plan:
 	$(HARNESS) queue --dry-run
+
+# Web board of issues by harness state. Usage: make dashboard [PORT=7878]
+dashboard:
+	$(HARNESS) dashboard --port $(or $(PORT),7878)

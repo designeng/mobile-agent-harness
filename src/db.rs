@@ -133,6 +133,11 @@ pub struct ResumableRun {
 pub struct RunRow {
     pub id: i64,
     pub name: String,
+    pub kind: String,
+    pub issue: Option<u64>,
+    pub title: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
     pub status: String,
     pub pid: u32,
     pub summary: Option<String>,
@@ -433,7 +438,8 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, status, pid, summary, error, pr_url, complexity,
                     (SELECT COALESCE(SUM(cost_usd), 0) FROM agent_calls WHERE run_id = runs.id),
-                    (SELECT COALESCE(MAX(iter), 0) FROM stages WHERE run_id = runs.id)
+                    (SELECT COALESCE(MAX(iter), 0) FROM stages WHERE run_id = runs.id),
+                    kind, issue, title, started_at, finished_at
              FROM runs WHERE name LIKE ?1 ORDER BY id DESC LIMIT ?2",
         )?;
         let mut rows = stmt
@@ -449,6 +455,11 @@ impl Db {
                     complexity: r.get(7)?,
                     cost: r.get(8)?,
                     iter: r.get(9)?,
+                    kind: r.get(10)?,
+                    issue: r.get::<_, Option<i64>>(11)?.map(|i| i as u64),
+                    title: r.get(12)?,
+                    started_at: r.get(13)?,
+                    finished_at: r.get(14)?,
                     stage: None,
                     last_activity: None,
                     live_transcript: None,
@@ -462,6 +473,66 @@ impl Db {
             self.fill_details(row)?;
         }
         Ok(rows)
+    }
+
+    /// Everything recorded about one run, for the dashboard; `None` if there is no such run.
+    pub fn run_detail(&self, id: i64) -> Result<Option<Value>> {
+        let Some(mut run) = self
+            .rows_json(
+                "SELECT id, name, kind, issue, title, issue_md, branch, status, started_at, finished_at,
+                        plan_md, complexity, summary, error, pr_url, checkpoint FROM runs WHERE id = ?1",
+                id,
+            )?
+            .pop()
+        else {
+            return Ok(None);
+        };
+        run["stages"] = self
+            .rows_json("SELECT id, iter, name, started_at, finished_at, ok, log_path, detail FROM stages WHERE run_id = ?1 ORDER BY id", id)?
+            .into();
+        run["agent_calls"] = self
+            .rows_json(
+                "SELECT id, stage_id, role, model, started_at, finished_at, duration_ms, num_turns, cost_usd,
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, error, transcript
+                 FROM agent_calls WHERE run_id = ?1 ORDER BY id",
+                id,
+            )?
+            .into();
+        let mut qa = self.rows_json("SELECT id, iter, verdict, notes, created_at FROM qa_results WHERE run_id = ?1 ORDER BY id", id)?;
+        for q in &mut qa {
+            let qid = q["id"].as_i64().unwrap_or(0);
+            q["criteria"] = self.rows_json("SELECT criterion, met, evidence FROM qa_criteria WHERE qa_id = ?1", qid)?.into();
+            q["bugs"] = self.rows_json("SELECT title, steps_json, expected, actual, evidence_json, logs FROM bugs WHERE qa_id = ?1", qid)?.into();
+        }
+        run["qa"] = qa.into();
+        let mut reviews = self.rows_json("SELECT id, iter, approve, pr_title, created_at FROM reviews WHERE run_id = ?1 ORDER BY id", id)?;
+        for r in &mut reviews {
+            let rid = r["id"].as_i64().unwrap_or(0);
+            r["comments"] = self.rows_json("SELECT body FROM review_comments WHERE review_id = ?1", rid)?.into();
+        }
+        run["reviews"] = reviews.into();
+        Ok(Some(run))
+    }
+
+    /// Rows of a one-parameter query as JSON objects keyed by column name.
+    fn rows_json(&self, sql: &str, param: i64) -> Result<Vec<Value>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let cols: Vec<String> = stmt.column_names().map(String::from).collect();
+        let rows = stmt.query_map([param], |r| {
+            let mut obj = serde_json::Map::new();
+            for (i, c) in cols.iter().enumerate() {
+                use rusqlite::types::ValueRef;
+                let v = match r.get_ref(i)? {
+                    ValueRef::Null => Value::Null,
+                    ValueRef::Integer(n) => n.into(),
+                    ValueRef::Real(f) => f.into(),
+                    ValueRef::Text(t) | ValueRef::Blob(t) => String::from_utf8_lossy(t).into_owned().into(),
+                };
+                obj.insert(c.clone(), v);
+            }
+            Ok(Value::Object(obj))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     fn fill_details(&self, row: &mut RunRow) -> Result<()> {
@@ -548,6 +619,14 @@ mod tests {
         assert_eq!(r.qa, Some(("fail".into(), 1)));
         assert_eq!(r.review, Some((false, 2)));
         assert!(r.live_transcript.is_none());
+        assert_eq!((r.kind.as_str(), r.issue), ("issue", Some(7)));
+        let d = db.run_detail(run)?.expect("detail");
+        assert_eq!(d["title"], "Fix login");
+        assert_eq!(d["stages"].as_array().map(Vec::len), Some(2));
+        assert_eq!(d["agent_calls"][0]["cost_usd"], 0.5);
+        assert_eq!(d["qa"][0]["bugs"][0]["title"], "b");
+        assert_eq!(d["reviews"][0]["comments"].as_array().map(Vec::len), Some(2));
+        assert!(db.run_detail(run + 100)?.is_none());
         assert!(db.recent_runs(Some("issue-8"), 5)?.is_empty());
         assert_eq!(db.cost_marker()?, call);
         assert_eq!(db.cost_since(call - 1)?, 0.5);
