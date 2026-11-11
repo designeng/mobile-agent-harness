@@ -60,3 +60,8 @@ pub async fn check(program: &str, args: &[&str], cwd: &Path) -> Result<String> {
     anyhow::ensure!(out.ok, "{program} {} failed: {}", args.join(" "), out.tail(2000));
     Ok(out.stdout.trim().to_string())
 }
+
+/// Whether a process with this pid exists (signal 0 probe).
+pub fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill").args(["-0", &pid.to_string()]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
+}

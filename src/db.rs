@@ -118,6 +118,17 @@ pub struct NewRun<'a> {
     pub worktree: &'a Path,
 }
 
+/// A stopped issue run that `harness run` / `queue` can continue.
+pub struct ResumableRun {
+    pub id: i64,
+    pub name: String,
+    pub dir: std::path::PathBuf,
+    pub plan_md: Option<String>,
+    pub checkpoint: Option<Value>,
+    /// Spent so far.
+    pub cost: f64,
+}
+
 /// One row of `harness status`.
 pub struct RunRow {
     pub id: i64,
@@ -162,7 +173,80 @@ impl Db {
             tx.pragma_update(None, "user_version", 1)?;
             tx.commit()?;
         }
+        if version < 2 {
+            // v2: resumable runs — a checkpoint per run, Claude session ids per agent call.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE runs ADD COLUMN checkpoint TEXT;
+                 ALTER TABLE agent_calls ADD COLUMN session_id TEXT;",
+            )?;
+            tx.pragma_update(None, "user_version", 2)?;
+            tx.commit()?;
+        }
         Ok(Db { conn })
+    }
+
+    pub fn set_checkpoint(&self, run: i64, checkpoint: &Value) -> Result<()> {
+        self.conn.execute("UPDATE runs SET checkpoint = ?2 WHERE id = ?1", params![run, checkpoint.to_string()])?;
+        Ok(())
+    }
+
+    /// The issue's newest run if it can be continued: it has a checkpoint and was either
+    /// interrupted by an environment problem or its process died (crash, Ctrl+C, reboot).
+    pub fn resumable_run(&self, issue: u64) -> Result<Option<ResumableRun>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, name, status, pid, dir, worktree, branch, plan_md, checkpoint,
+                        (SELECT COALESCE(SUM(cost_usd), 0) FROM agent_calls WHERE run_id = runs.id)
+                 FROM runs WHERE kind = 'issue' AND issue = ?1 ORDER BY id DESC LIMIT 1",
+                [issue as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(2)?,
+                        r.get::<_, u32>(3)?,
+                        ResumableRun {
+                            id: r.get(0)?,
+                            name: r.get(1)?,
+                            dir: r.get::<_, String>(4)?.into(),
+                            plan_md: r.get(7)?,
+                            checkpoint: r.get::<_, Option<String>>(8)?.and_then(|s| serde_json::from_str(&s).ok()),
+                            cost: r.get(9)?,
+                        },
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(status, pid, run)| {
+            let stopped = status == "interrupted" || (status == "running" && !crate::shell::pid_alive(pid));
+            (stopped && run.checkpoint.is_some() && run.plan_md.is_some()).then_some(run)
+        }))
+    }
+
+    /// Issues whose newest run is resumable (see `resumable_run`), oldest first.
+    pub fn resumable_issues(&self) -> Result<Vec<u64>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT issue FROM runs WHERE kind = 'issue' AND issue IS NOT NULL ORDER BY issue")?;
+        let issues = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out = vec![];
+        for i in issues {
+            if self.resumable_run(i as u64)?.is_some() {
+                out.push(i as u64);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Takes over a stopped run in this process: closes what the dead process left open.
+    pub fn reopen_run(&self, run: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(&format!("UPDATE stages SET finished_at = {NOW}, ok = 0, detail = COALESCE(detail, 'interrupted') WHERE run_id = ?1 AND finished_at IS NULL"), [run])?;
+        tx.execute(&format!("UPDATE agent_calls SET finished_at = {NOW}, error = COALESCE(error, 'interrupted') WHERE run_id = ?1 AND finished_at IS NULL"), [run])?;
+        tx.execute(
+            "UPDATE runs SET status = 'running', error = NULL, finished_at = NULL, pid = ?2 WHERE id = ?1",
+            params![run, std::process::id()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn create_run(&self, r: &NewRun) -> Result<i64> {
@@ -201,19 +285,24 @@ impl Db {
         Ok(())
     }
 
+    pub fn pr_url(&self, run: i64) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT pr_url FROM runs WHERE id = ?1", [run], |r| r.get(0))?)
+    }
+
     pub fn set_pr(&self, run: i64, url: &str) -> Result<()> {
         self.conn.execute("UPDATE runs SET pr_url = ?2 WHERE id = ?1", params![run, url])?;
         Ok(())
     }
 
     /// Marks the run finished and closes stages/agent calls left open by an error.
-    pub fn finish_run(&self, run: i64, error: Option<&str>) -> Result<()> {
+    /// `interrupted`: stopped by an environment problem — the run stays resumable.
+    pub fn finish_run(&self, run: i64, error: Option<&str>, interrupted: bool) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(&format!("UPDATE stages SET finished_at = {NOW}, ok = 0 WHERE run_id = ?1 AND finished_at IS NULL"), [run])?;
         tx.execute(&format!("UPDATE agent_calls SET finished_at = {NOW}, error = COALESCE(error, 'interrupted') WHERE run_id = ?1 AND finished_at IS NULL"), [run])?;
         tx.execute(
             &format!("UPDATE runs SET status = ?2, error = ?3, finished_at = {NOW} WHERE id = ?1"),
-            params![run, if error.is_some() { "failed" } else { "done" }, error],
+            params![run, if interrupted { "interrupted" } else if error.is_some() { "failed" } else { "done" }, error],
         )?;
         tx.commit()?;
         Ok(())
@@ -232,10 +321,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn agent_start(&self, run: i64, stage: i64, role: &str, model: Option<&str>, transcript: &Path) -> Result<i64> {
+    pub fn agent_start(&self, run: i64, stage: i64, role: &str, model: Option<&str>, transcript: &Path, session_id: Option<&str>) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO agent_calls (run_id, stage_id, role, model, transcript) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![run, stage, role, model, transcript.to_string_lossy()],
+            "INSERT INTO agent_calls (run_id, stage_id, role, model, transcript, session_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![run, stage, role, model, transcript.to_string_lossy(), session_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -250,7 +339,7 @@ impl Db {
             &format!(
                 "UPDATE agent_calls SET finished_at = {NOW}, model = COALESCE(?2, model), duration_ms = ?3, num_turns = ?4,
                  cost_usd = ?5, input_tokens = ?6, output_tokens = ?7, cache_read_tokens = ?8, cache_write_tokens = ?9,
-                 result_text = ?10, structured_json = ?11, error = ?12 WHERE id = ?1"
+                 result_text = ?10, structured_json = ?11, error = ?12, session_id = COALESCE(?13, session_id) WHERE id = ?1"
             ),
             params![
                 call,
@@ -264,7 +353,8 @@ impl Db {
                 r.cache_write_tokens,
                 res.as_ref().ok().map(|r| r.text.as_str()),
                 r.structured.as_ref().map(|v| v.to_string()),
-                err
+                err,
+                r.session_id
             ],
         )?;
         Ok(())
@@ -315,14 +405,15 @@ impl Db {
         Ok(())
     }
 
-    /// Id of the newest run, 0 if none; a marker for `cost_since`.
-    pub fn max_run_id(&self) -> Result<i64> {
-        Ok(self.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM runs", [], |r| r.get(0))?)
+    /// Id of the newest agent call, 0 if none; a marker for `cost_since`.
+    /// (Agent calls, not runs: a resumed run is old but its new calls must count.)
+    pub fn cost_marker(&self) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM agent_calls", [], |r| r.get(0))?)
     }
 
-    /// Total agent cost of runs created after run `after`.
+    /// Total cost of agent calls made after `cost_marker()` returned `after`.
     pub fn cost_since(&self, after: i64) -> Result<f64> {
-        Ok(self.conn.query_row("SELECT COALESCE(SUM(cost_usd), 0) FROM agent_calls WHERE run_id > ?1", [after], |r| r.get(0))?)
+        Ok(self.conn.query_row("SELECT COALESCE(SUM(cost_usd), 0) FROM agent_calls WHERE id > ?1", [after], |r| r.get(0))?)
     }
 
     /// Most recent `last` runs whose name contains `filter`, oldest first.
@@ -420,7 +511,7 @@ mod tests {
         db.set_issue(run, "Fix login", "# Fix login")?;
 
         let st = db.stage_start(run, 1, "developer")?;
-        let call = db.agent_start(run, st, "developer", None, &dir.join("developer-1.jsonl"))?;
+        let call = db.agent_start(run, st, "developer", None, &dir.join("developer-1.jsonl"), Some("s1"))?;
         let res = AgentResult { cost_usd: 0.5, input_tokens: Some(10), model: Some("m".into()), ..Default::default() };
         db.agent_end(call, &Ok(res))?;
         db.stage_end(st, true, None, None)?;
@@ -430,7 +521,7 @@ mod tests {
         db.save_review(run, 1, &json!({"approve": false, "blocking_comments": ["a", "b"], "pr_title": "t", "pr_body": ""}))?;
         // Left open: finish_run must close it.
         db.stage_start(run, 2, "build")?;
-        db.finish_run(run, Some("boom"))?;
+        db.finish_run(run, Some("boom"), false)?;
 
         // Reopening must not re-apply the schema.
         let db = Db::open(&dir)?;
@@ -446,9 +537,19 @@ mod tests {
         assert_eq!(r.review, Some((false, 2)));
         assert!(r.live_transcript.is_none());
         assert!(db.recent_runs(Some("issue-8"), 5)?.is_empty());
-        assert_eq!(db.max_run_id()?, run);
-        assert_eq!(db.cost_since(run - 1)?, 0.5);
-        assert_eq!(db.cost_since(run)?, 0.0);
+        assert_eq!(db.cost_marker()?, call);
+        assert_eq!(db.cost_since(call - 1)?, 0.5);
+        assert_eq!(db.cost_since(call)?, 0.0);
+        // Failed runs are not resumable; interrupted ones with a plan and checkpoint are.
+        assert!(db.resumable_run(7)?.is_none());
+        db.set_plan(run, &json!({}), "plan")?;
+        db.set_checkpoint(run, &json!({"iter": 2, "step": "gate"}))?;
+        db.finish_run(run, Some("device gone"), true)?;
+        let r = db.resumable_run(7)?.expect("resumable");
+        assert_eq!((r.id, r.cost), (run, 0.5));
+        assert_eq!(db.resumable_issues()?, vec![7]);
+        db.reopen_run(run)?;
+        assert!(db.resumable_run(7)?.is_none(), "running in this live process");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

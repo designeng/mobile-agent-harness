@@ -10,6 +10,8 @@ enum State {
     Running,
     Done,
     Failed,
+    /// Stopped by an environment problem; resumable.
+    Interrupted,
     Crashed,
 }
 
@@ -19,6 +21,7 @@ impl State {
             State::Running => "RUNNING",
             State::Done => "DONE",
             State::Failed => "FAILED",
+            State::Interrupted => "PAUSED",
             State::Crashed => "CRASHED",
         }
     }
@@ -80,7 +83,8 @@ fn info(r: RunRow) -> RunInfo {
     let state = match r.status.as_str() {
         "done" => State::Done,
         "failed" => State::Failed,
-        _ if pid_alive(r.pid) => State::Running,
+        "interrupted" => State::Interrupted,
+        _ if crate::shell::pid_alive(r.pid) => State::Running,
         _ => State::Crashed,
     };
     let mut stage = match (&r.stage, state) {
@@ -92,8 +96,14 @@ fn info(r: RunRow) -> RunInfo {
             if *finished { format!("{label} done{n}") } else { format!("{label}{n}") }
         }
     };
-    if state == State::Crashed {
-        stage.push_str(" (process gone, see .harness/run-*.log)");
+    let issue = r.name.rsplit_once("-issue-").map(|(_, n)| n.to_string());
+    match (state, &issue) {
+        (State::Crashed | State::Interrupted, Some(n)) => {
+            let why = if state == State::Crashed { "process gone" } else { "environment problem" };
+            stage.push_str(&format!(" ({why}; continue with `harness run {n}` or `harness queue`)"));
+        }
+        (State::Crashed, None) => stage.push_str(" (process gone, see .harness/run-*.log)"),
+        _ => {}
     }
 
     // A live agent writes to its transcript long before the DB hears about it.
@@ -109,7 +119,7 @@ fn info(r: RunRow) -> RunInfo {
         verdict.push(format!("review: {} ({n} blocking)", if approve { "approved" } else { "changes requested" }));
     }
     let head = match state {
-        State::Failed => r.error.as_deref().and_then(|e| e.lines().next()).unwrap_or("").to_string(),
+        State::Failed | State::Interrupted => r.error.as_deref().and_then(|e| e.lines().next()).unwrap_or("").to_string(),
         _ => match (&r.pr_url, r.summary.as_deref().and_then(|s| s.lines().next())) {
             (Some(url), Some(h)) => format!("{h} | {url}"),
             (_, h) => h.unwrap_or("").to_string(),
@@ -133,10 +143,6 @@ fn stage_label(name: &str) -> &str {
         "pr" => "opening PR",
         other => other,
     }
-}
-
-fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill").args(["-0", &pid.to_string()]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
 fn fmt_dur(d: Duration) -> String {

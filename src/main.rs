@@ -28,6 +28,7 @@ enum Cmd {
         config: PathBuf,
     },
     /// Implement a GitHub issue end-to-end: plan → code → build → device QA → review → commit.
+    /// Continues the issue's stopped run (crash, Ctrl+C, environment problem) from its last step.
     Run {
         issue: u64,
         #[arg(long, default_value = "harness.toml")]
@@ -35,6 +36,9 @@ enum Cmd {
         /// Push the branch and open a draft PR at the end.
         #[arg(long)]
         pr: bool,
+        /// Don't continue a stopped run of this issue: start a new run (re-plan). The worktree is kept.
+        #[arg(long)]
+        fresh: bool,
     },
     /// Run open issues labelled ready (see [queue] in harness.toml) one by one; an agent picks the order.
     Queue {
@@ -101,10 +105,10 @@ async fn main() -> Result<()> {
 
     match Cli::parse().cmd {
         Cmd::Doctor { config } => doctor(&config).await,
-        Cmd::Run { issue, config, pr } => {
+        Cmd::Run { issue, config, pr, fresh } => {
             let cfg = config::Config::load(&config)?;
             cfg.check_skills()?;
-            pipeline::run_issue(cfg, issue, pr).await
+            pipeline::run_issue(cfg, issue, pr, fresh).await
         }
         Cmd::Queue { config, max_issues, budget_usd, no_pr, dry_run } => {
             let cfg = config::Config::load(&config)?;

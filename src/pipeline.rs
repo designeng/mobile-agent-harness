@@ -2,10 +2,11 @@
 
 use crate::agent::{self, AgentSpec};
 use crate::config::Config;
-use crate::db::{Db, NewRun};
+use crate::db::{Db, NewRun, ResumableRun};
 use crate::device::{self, Adb};
 use crate::{github, mcp, shell};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -56,10 +57,20 @@ impl Run {
         Ok(Run { cfg, dir, worktree, cost: 0.0, db, id, iter: 0 })
     }
 
-    /// Records the run's outcome; passes the result through.
+    /// Continues a stopped run (same id, dir and history) in this process.
+    fn resume(cfg: Config, r: ResumableRun) -> Result<Run> {
+        let db = Db::open(&cfg.state_dir())?;
+        db.reopen_run(r.id)?;
+        let worktree = cfg.app.repo.clone();
+        Ok(Run { cfg, dir: r.dir, worktree, cost: r.cost, db, id: r.id, iter: 0 })
+    }
+
+    /// Records the run's outcome; passes the result through. Environment failures leave
+    /// the run `interrupted` (resumable), anything else marks it `failed`.
     pub(crate) fn finish<T>(&self, res: Result<T>) -> Result<T> {
         let err = res.as_ref().err().map(|e| format!("{e:#}"));
-        if let Err(e) = self.db.finish_run(self.id, err.as_deref()) {
+        let interrupted = res.as_ref().err().is_some_and(|e| e.downcast_ref::<EnvError>().is_some());
+        if let Err(e) = self.db.finish_run(self.id, err.as_deref(), interrupted) {
             tracing::error!("recording run outcome: {e:#}");
         }
         res
@@ -83,13 +94,16 @@ impl Run {
         if let Some(dir) = self.skills_bundle(role)? {
             spec.add_dirs.push(dir);
         }
-        let path = self.dir.join(log);
+        let path = unique_path(&self.dir, log);
         let stage = self.stage(role)?;
-        let call = self.db.agent_start(self.id, stage, role, spec.model.as_deref(), &path)?;
+        let session = spec.resume.as_deref().or(spec.session_id.as_deref());
+        let call = self.db.agent_start(self.id, stage, role, spec.model.as_deref(), &path, session)?;
         let res = agent::run(spec, &path).await;
         self.db.agent_end(call, &res)?;
         self.end(stage, matches!(&res, Ok(r) if r.error.is_none()), None, None)?;
-        let res = res?;
+        // No result at all = the CLI died or could not start (network, auth, killed): an
+        // environment problem, so the run stays resumable instead of failing the issue.
+        let res = res.map_err(|e| EnvError(format!("{e:#}")))?;
         self.cost += res.cost_usd;
         if let Some(e) = res.error {
             anyhow::bail!(e);
@@ -142,6 +156,20 @@ impl Run {
         std::fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
         Ok(path)
     }
+}
+
+/// `dir/name`, or `dir/<stem>-r2.<ext>`, `-r3`… if taken (a resumed step must not
+/// overwrite the transcript of the interrupted attempt).
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+    (2..)
+        .map(|i| dir.join(if ext.is_empty() { format!("{stem}-r{i}") } else { format!("{stem}-r{i}.{ext}") }))
+        .find(|p| !p.exists())
+        .unwrap()
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
@@ -333,14 +361,75 @@ async fn regression(run: &Run, adb: &Adb) -> Result<Vec<String>> {
     Ok(fails)
 }
 
-pub async fn run_issue(cfg: Config, issue_no: u64, open_pr: bool) -> Result<()> {
-    let mut run = Run::start(cfg, "issue", Some(issue_no), None)?;
-    let res = issue_inner(&mut run, issue_no, open_pr).await;
+/// Where an issue run stands; saved after every step so a stopped run continues from
+/// the step it was in (`harness run N` / `harness queue` pick it up automatically).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Checkpoint {
+    /// Fix-loop iteration, 1-based.
+    iter: u32,
+    step: Step,
+    /// What the developer must fix in this iteration (gate errors, QA bugs, review comments).
+    #[serde(default)]
+    feedback: Option<String>,
+    /// Developer's Claude session: continued across iterations and after interruptions.
+    #[serde(default)]
+    dev_session: Option<String>,
+    /// The developer turn was started but never finished (process died mid-way).
+    #[serde(default)]
+    dev_running: bool,
+    /// Approved review (pr_title / pr_body), from `Commit` on.
+    #[serde(default)]
+    review: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum Step {
+    Develop,
+    Gate,
+    Device,
+    Review,
+    Commit,
+    Pr,
+}
+
+impl Checkpoint {
+    fn new() -> Self {
+        Checkpoint { iter: 1, step: Step::Develop, feedback: None, dev_session: None, dev_running: false, review: None }
+    }
+
+    /// Back to the developer with feedback.
+    fn retry(&mut self, feedback: String) {
+        self.iter += 1;
+        self.step = Step::Develop;
+        self.feedback = Some(feedback);
+    }
+}
+
+impl Run {
+    fn save(&self, cp: &Checkpoint) -> Result<()> {
+        self.db.set_checkpoint(self.id, &serde_json::to_value(cp)?)
+    }
+}
+
+/// `fresh`: ignore a stopped earlier run of this issue and start over (the worktree is kept).
+pub async fn run_issue(cfg: Config, issue_no: u64, open_pr: bool, fresh: bool) -> Result<()> {
+    let prev = if fresh { None } else { Db::open(&cfg.state_dir())?.resumable_run(issue_no)? };
+    let (mut run, resume) = match prev {
+        Some(r) => {
+            let cp: Checkpoint = serde_json::from_value(r.checkpoint.clone().unwrap_or_default()).context("bad checkpoint")?;
+            let plan_md = r.plan_md.clone().unwrap_or_default();
+            tracing::info!(run = %r.name, iter = cp.iter, step = ?cp.step, spent = format!("{:.2}", r.cost), "resuming stopped run");
+            (Run::resume(cfg, r)?, Some((plan_md, cp)))
+        }
+        None => (Run::start(cfg, "issue", Some(issue_no), None)?, None),
+    };
+    let res = issue_inner(&mut run, issue_no, open_pr, resume).await;
     run.finish(res)
 }
 
-async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool) -> Result<()> {
-    let issue = github::fetch_issue(&run.cfg.github.repo, issue_no).await?;
+async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool, resume: Option<(String, Checkpoint)>) -> Result<()> {
+    let issue = github::fetch_issue(&run.cfg.github.repo, issue_no).await.map_err(|e| EnvError(format!("github: {e:#}")))?;
     let issue_md = issue.as_markdown();
     run.db.set_issue(run.id, &issue.title, &issue_md)?;
     let (worktree, branch) = prepare_worktree(&run.cfg, issue_no).await?;
@@ -354,147 +443,268 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool) -> Result<()> 
     adb.check_usb_install_allowed().await.map_err(|e| EnvError(format!("device: {e:#}")))?;
 
     let contract = format!(
-        "\n# Build contract (the harness enforces this)\n- Build: `{}` (run from the repo root)\n- APK expected at: `{}`\n- Unit tests: `{}`\n- Must run on a real device WITHOUT a dev server (JS bundle embedded in the APK).\n",
+        "\n# Build contract (the harness enforces this)\n\
+         - Build gate — the harness runs it from the repo root right after you finish and sends you any errors; \
+         do NOT run it yourself: `{}`\n- APK expected at: `{}`\n- Unit tests: `{}`\n\
+         - Must run on a real device WITHOUT a dev server (JS bundle embedded in the APK).\n",
         run.cfg.app.build,
         run.cfg.app.apk.display(),
         run.cfg.app.unit_tests.as_deref().unwrap_or("(none)")
     );
 
-    // 1. Plan
-    let mut spec = AgentSpec::new("planner", PLANNER, format!("{issue_md}\n{contract}\nProduce the plan."), &run.worktree);
-    spec.model = run.cfg.light_model().map(String::from);
-    spec.allowed_tools = vec!["Read".into(), "Glob".into(), "Grep".into()];
-    spec.json_schema = Some(plan_schema());
-    let plan = run.agent(spec, "planner.jsonl").await?.structured.context("planner returned no plan")?;
-    let plan_md = render_plan(&plan);
-    run.db.set_plan(run.id, &plan, &plan_md)?;
+    // 1. Plan (once per run; a resumed run reuses it)
+    let (plan_md, mut cp) = match resume {
+        Some(r) => r,
+        None => {
+            let mut spec = AgentSpec::new("planner", PLANNER, format!("{issue_md}\n{contract}\nProduce the plan."), &run.worktree);
+            spec.model = run.cfg.light_model().map(String::from);
+            spec.allowed_tools = vec!["Read".into(), "Glob".into(), "Grep".into()];
+            spec.json_schema = Some(plan_schema());
+            let plan = run.agent(spec, "planner.jsonl").await?.structured.context("planner returned no plan")?;
+            let plan_md = render_plan(&plan);
+            run.db.set_plan(run.id, &plan, &plan_md)?;
+            let cp = Checkpoint::new();
+            run.save(&cp)?;
+            (plan_md, cp)
+        }
+    };
 
     let mcp_cfg = run.write_mcp_config(&adb.serial)?;
     let flows_rel = run.cfg.app.flows_dir.display().to_string();
-    let mut feedback: Option<String> = None;
-    let mut review: Option<Value> = None;
-
-    for iter in 1..=run.cfg.agents.max_fix_iterations {
-        run.iter = iter;
-        tracing::info!(iter, "iteration");
-        // 2. Develop
-        let mut prompt = format!("{issue_md}\n\n# Plan\n{plan_md}\n{contract}");
-        if let Some(f) = &feedback {
-            let _ = write!(prompt, "\n# Feedback from the previous iteration — fix this\n{f}\n");
-        }
-        let mut spec = AgentSpec::new("developer", DEVELOPER, prompt, &run.worktree);
-        spec.model = run.cfg.dev_model().map(String::from);
-        spec.allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash"].map(String::from).to_vec();
-        spec.disallowed_tools = [
-            "Bash(git push:*)", "Bash(git commit:*)", "Bash(git reset:*)", "Bash(git checkout:*)",
-            "Bash(adb:*)", "Bash(maestro:*)", "Bash(rm -rf:*)", "WebFetch", "WebSearch",
-        ]
-        .map(String::from)
-        .to_vec();
-        run.agent(spec, &format!("developer-{iter}.jsonl")).await?;
-
-        // 3. Deterministic gate
-        if let Some(f) = gate(run).await? {
-            tracing::warn!("gate failed");
-            feedback = Some(f);
-            continue;
-        }
-
-        // 4. Device: install, regression, exploratory QA — under an exclusive lease.
-        let qa = {
-            let _lease = device::acquire_lease(&adb.serial, &format!("issue-{issue_no}")).await?;
-            let stage = run.stage("install")?;
-            let apk = run.worktree.join(&run.cfg.app.apk);
-            let inst = adb.install_confirmed(&apk, Duration::from_secs(120)).await?;
-            run.end(stage, inst.ok, None, (!inst.ok).then(|| inst.tail(3000)).as_deref())?;
-            if !inst.ok {
-                // The APK was built fine: this is a device/environment problem, not
-                // something the developer agent can fix — don't burn an iteration on it.
-                return Err(EnvError(format!("APK install failed on the device (environment problem):\n{}", inst.tail(3000))).into());
-            }
-            let reg_fails = regression(run, &adb).await?;
-            let _ = adb.logcat_clear().await;
-            let mut prompt = format!(
-                "{issue_md}\n\n# Plan\n{plan_md}\n\nThe new build is already installed. \
-                 Save Maestro flows into `{flows_rel}/`.\n"
-            );
-            if !reg_fails.is_empty() {
-                let _ = write!(prompt, "\n# Saved regression flows that failed on this build\n{}\n", reg_fails.join("\n\n"));
-            }
-            let mut spec = AgentSpec::new("qa", QA, prompt, &run.worktree);
-            spec.model = run.cfg.dev_model().map(String::from);
-            spec.mcp_config = Some(mcp_cfg.clone());
-            spec.allowed_tools = [
-                "mcp__mobile".to_string(),
-                "mcp__device".to_string(),
-                "Read".into(), "Glob".into(), "Grep".into(),
-            ]
-            .to_vec();
-            spec.allowed_tools.extend(flows_write_rules(&run.worktree.join(&run.cfg.app.flows_dir)));
-            spec.disallowed_tools = vec!["Bash".into(), "WebFetch".into(), "WebSearch".into()];
-            spec.json_schema = Some(qa_schema());
-            let qa = run.agent(spec, &format!("qa-{iter}.jsonl")).await?.structured.context("qa returned no verdict")?;
-            run.db.save_qa(run.id, iter, &qa)?;
-            qa
-        };
-
-        match qa["verdict"].as_str() {
-            Some("pass") => {}
-            Some("blocked") => return Err(EnvError(format!("QA blocked (environment problem): {}", qa["notes"])).into()),
-            _ => {
-                feedback = Some(render_qa_feedback(&qa));
-                continue;
-            }
-        }
-
-        // 5. Review
-        let mut spec = AgentSpec::new(
-            "reviewer",
-            REVIEWER,
-            format!("{issue_md}\n\n# Plan\n{plan_md}\n\nReview the uncommitted changes in this worktree (`git status`, `git diff`)."),
-            &run.worktree,
-        );
-        spec.model = run.cfg.light_model().map(String::from);
-        spec.allowed_tools = ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git status:*)", "Bash(git log:*)"]
-            .map(String::from)
-            .to_vec();
-        spec.json_schema = Some(review_schema());
-        let r = run.agent(spec, &format!("review-{iter}.jsonl")).await?.structured.context("reviewer returned nothing")?;
-        run.db.save_review(run.id, iter, &r)?;
-        if r["approve"] == true {
-            review = Some(r);
-            break;
-        }
-        let comments: Vec<&str> = r["blocking_comments"].as_array().into_iter().flatten().filter_map(|c| c.as_str()).collect();
-        feedback = Some(format!("Code review requested changes:\n- {}", comments.join("\n- ")));
-    }
-    run.iter = 0;
-
     let max = run.cfg.agents.max_fix_iterations;
-    let Some(review) = review else {
-        run.db.set_summary(run.id, &format!("Last feedback:\n\n{}\n", feedback.unwrap_or_default()))?;
-        anyhow::bail!("not done after {max} iterations (cost ${:.2}); see `harness status issue-{issue_no}`", run.cost);
-    };
 
-    // 6. Commit (+ optional PR)
-    let stage = run.stage("commit")?;
-    let title = review["pr_title"].as_str().unwrap_or(&issue.title).to_string();
-    shell::check("git", &["add", "-A"], &run.worktree).await?;
-    let _ = std::fs::remove_file(run.worktree.join("local.properties"));
-    shell::check("git", &["commit", "-m", &format!("{title}\n\nCloses #{issue_no}")], &run.worktree).await?;
-    run.end(stage, true, None, None)?;
+    loop {
+        if cp.iter > max {
+            run.iter = 0;
+            run.db.set_summary(run.id, &format!("Last feedback:\n\n{}\n", cp.feedback.clone().unwrap_or_default()))?;
+            anyhow::bail!("not done after {max} iterations (cost ${:.2}); see `harness status issue-{issue_no}`", run.cost);
+        }
+        run.iter = if matches!(cp.step, Step::Commit | Step::Pr) { 0 } else { cp.iter };
+        match cp.step {
+            // 2. Develop
+            Step::Develop => {
+                tracing::info!(iter = cp.iter, "iteration");
+                develop(run, &mut cp, &issue_md, &plan_md, &contract).await?;
+                wip_commit(run, &format!("wip: issue #{issue_no} iteration {} (developer)", cp.iter)).await?;
+                cp.step = Step::Gate;
+            }
+
+            // 3. Deterministic gate
+            Step::Gate => match gate(run).await? {
+                Some(f) => {
+                    tracing::warn!("gate failed");
+                    cp.retry(f);
+                }
+                None => cp.step = Step::Device,
+            },
+
+            // 4. Device: install, regression, exploratory QA — under an exclusive lease.
+            Step::Device => {
+                let qa = {
+                    let _lease = device::acquire_lease(&adb.serial, &format!("issue-{issue_no}")).await?;
+                    let stage = run.stage("install")?;
+                    let apk = run.worktree.join(&run.cfg.app.apk);
+                    let inst = adb.install_confirmed(&apk, Duration::from_secs(120)).await?;
+                    run.end(stage, inst.ok, None, (!inst.ok).then(|| inst.tail(3000)).as_deref())?;
+                    if !inst.ok {
+                        // The APK was built fine: this is a device/environment problem, not
+                        // something the developer agent can fix — don't burn an iteration on it.
+                        return Err(EnvError(format!("APK install failed on the device (environment problem):\n{}", inst.tail(3000))).into());
+                    }
+                    let reg_fails = regression(run, &adb).await?;
+                    let _ = adb.logcat_clear().await;
+                    let mut prompt = format!(
+                        "{issue_md}\n\n# Plan\n{plan_md}\n\nThe new build is already installed. \
+                         Save Maestro flows into `{flows_rel}/`.\n"
+                    );
+                    if !reg_fails.is_empty() {
+                        let _ = write!(prompt, "\n# Saved regression flows that failed on this build\n{}\n", reg_fails.join("\n\n"));
+                    }
+                    let mut spec = AgentSpec::new("qa", QA, prompt, &run.worktree);
+                    spec.model = run.cfg.dev_model().map(String::from);
+                    spec.mcp_config = Some(mcp_cfg.clone());
+                    spec.allowed_tools = [
+                        "mcp__mobile".to_string(),
+                        "mcp__device".to_string(),
+                        "Read".into(), "Glob".into(), "Grep".into(),
+                    ]
+                    .to_vec();
+                    spec.allowed_tools.extend(flows_write_rules(&run.worktree.join(&run.cfg.app.flows_dir)));
+                    spec.disallowed_tools = vec!["Bash".into(), "WebFetch".into(), "WebSearch".into()];
+                    spec.json_schema = Some(qa_schema());
+                    let qa = run.agent(spec, &format!("qa-{}.jsonl", cp.iter)).await?.structured.context("qa returned no verdict")?;
+                    run.db.save_qa(run.id, cp.iter, &qa)?;
+                    qa
+                };
+                // QA may have saved new Maestro flows.
+                wip_commit(run, &format!("wip: issue #{issue_no} iteration {} (qa flows)", cp.iter)).await?;
+                match qa["verdict"].as_str() {
+                    Some("pass") => cp.step = Step::Review,
+                    Some("blocked") => return Err(EnvError(format!("QA blocked (environment problem): {}", qa["notes"])).into()),
+                    _ => cp.retry(render_qa_feedback(&qa)),
+                }
+            }
+
+            // 5. Review
+            Step::Review => {
+                let base = base_commit(run).await?;
+                let mut spec = AgentSpec::new(
+                    "reviewer",
+                    REVIEWER,
+                    format!(
+                        "{issue_md}\n\n# Plan\n{plan_md}\n\nReview this branch's changes: `git diff {base}` \
+                         (the branch holds work-in-progress commits; `git log {base}..HEAD` lists them)."
+                    ),
+                    &run.worktree,
+                );
+                spec.model = run.cfg.light_model().map(String::from);
+                spec.allowed_tools = ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git status:*)", "Bash(git log:*)"]
+                    .map(String::from)
+                    .to_vec();
+                spec.json_schema = Some(review_schema());
+                let r = run.agent(spec, &format!("review-{}.jsonl", cp.iter)).await?.structured.context("reviewer returned nothing")?;
+                run.db.save_review(run.id, cp.iter, &r)?;
+                if r["approve"] == true {
+                    cp.review = Some(r);
+                    cp.step = Step::Commit;
+                } else {
+                    let comments: Vec<&str> = r["blocking_comments"].as_array().into_iter().flatten().filter_map(|c| c.as_str()).collect();
+                    cp.retry(format!("Code review requested changes:\n- {}", comments.join("\n- ")));
+                }
+            }
+
+            // 6. Commit: squash the WIP commits into one (idempotent, so safe to repeat on resume).
+            Step::Commit => {
+                let stage = run.stage("commit")?;
+                let title = commit_title(&cp, &issue.title);
+                let base = base_commit(run).await?;
+                shell::check("git", &["reset", "--soft", &base], &run.worktree).await?;
+                stage_all(run).await?;
+                shell::check("git", &["commit", "--no-verify", "-m", &format!("{title}\n\nCloses #{issue_no}")], &run.worktree).await?;
+                run.end(stage, true, None, None)?;
+                if !open_pr {
+                    break;
+                }
+                cp.step = Step::Pr;
+            }
+
+            // 7. PR
+            Step::Pr => {
+                let stage = run.stage("pr")?;
+                let title = commit_title(&cp, &issue.title);
+                let pr_body = cp.review.as_ref().and_then(|r| r["pr_body"].as_str()).unwrap_or("");
+                let body = format!("{pr_body}\n\nCloses #{issue_no}\n\nVerified on a real device by the harness QA agent. Run artifacts: `{}`", run.dir.display());
+                let url = github::open_pr(&run.worktree, &run.cfg.github.repo, &run.cfg.app.base_branch, &branch, &title, &body)
+                    .await
+                    .map_err(|e| EnvError(format!("opening PR: {e:#}")))?;
+                run.end(stage, true, None, Some(&url))?;
+                run.db.set_pr(run.id, &url)?;
+                break;
+            }
+        }
+        run.save(&cp)?;
+    }
+
+    let title = commit_title(&cp, &issue.title);
     let mut summary = format!("DONE: {title}\nbranch: {branch}\ncost: ${:.2}\n", run.cost);
-    if open_pr {
-        let stage = run.stage("pr")?;
-        let body = format!("{}\n\nCloses #{issue_no}\n\nVerified on a real device by the harness QA agent. Run artifacts: `{}`", review["pr_body"].as_str().unwrap_or(""), run.dir.display());
-        let url = github::open_pr(&run.worktree, &run.cfg.github.repo, &run.cfg.app.base_branch, &branch, &title, &body).await?;
-        run.end(stage, true, None, Some(&url))?;
-        run.db.set_pr(run.id, &url)?;
+    if let Some(url) = run.db.pr_url(run.id)?.filter(|_| open_pr) {
         let _ = writeln!(summary, "PR: {url}");
     }
     run.db.set_summary(run.id, &summary)?;
     println!("{summary}");
     Ok(())
+}
+
+fn commit_title(cp: &Checkpoint, fallback: &str) -> String {
+    cp.review.as_ref().and_then(|r| r["pr_title"].as_str()).unwrap_or(fallback).to_string()
+}
+
+/// The developer step. Continues the developer's own Claude session when there is one
+/// (it remembers its earlier decisions), otherwise starts a new one with the full context.
+async fn develop(run: &mut Run, cp: &mut Checkpoint, issue_md: &str, plan_md: &str, contract: &str) -> Result<()> {
+    let log = format!("developer-{}.jsonl", cp.iter);
+    if let Some(session) = cp.dev_session.clone() {
+        let prompt = match (&cp.feedback, cp.dev_running) {
+            (_, true) => "Your previous turn was interrupted (the harness was restarted). Check `git status` / `git diff` \
+                          to see what is already done, then finish the task."
+                .to_string(),
+            (Some(f), false) => format!("# Feedback from the previous iteration — fix this\n{f}\n"),
+            (None, false) => "Continue the task.".to_string(),
+        };
+        cp.dev_running = true;
+        run.save(cp)?;
+        let mut spec = developer_spec(run, prompt);
+        spec.resume = Some(session.clone());
+        let path = run.dir.join(&log);
+        match run.agent(spec, &log).await {
+            Ok(res) => {
+                cp.dev_session = res.session_id.or(Some(session));
+                cp.dev_running = false;
+                return Ok(());
+            }
+            // Session gone (e.g. another machine, cleared ~/.claude): start over below.
+            Err(e) if !transcript_has_turns(&path) => tracing::warn!("cannot resume developer session {session}: {e:#}; starting a new one"),
+            Err(e) => return Err(e),
+        }
+    }
+    let mut prompt = format!("{issue_md}\n\n# Plan\n{plan_md}\n{contract}");
+    if let Some(f) = &cp.feedback {
+        let _ = write!(prompt, "\n# Feedback from the previous iteration — fix this\n{f}\n");
+    }
+    let mut spec = developer_spec(run, prompt);
+    let id = agent::new_session_id()?;
+    spec.session_id = Some(id.clone());
+    cp.dev_session = Some(id.clone());
+    cp.dev_running = true;
+    run.save(cp)?;
+    let res = run.agent(spec, &log).await?;
+    cp.dev_session = res.session_id.or(Some(id));
+    cp.dev_running = false;
+    Ok(())
+}
+
+fn developer_spec(run: &Run, prompt: String) -> AgentSpec {
+    let mut spec = AgentSpec::new("developer", DEVELOPER, prompt, &run.worktree);
+    spec.model = run.cfg.dev_model().map(String::from);
+    spec.persist_session = true;
+    spec.allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash"].map(String::from).to_vec();
+    spec.disallowed_tools = [
+        "Bash(git push:*)", "Bash(git commit:*)", "Bash(git reset:*)", "Bash(git checkout:*)",
+        "Bash(adb:*)", "Bash(maestro:*)", "Bash(rm -rf:*)", "WebFetch", "WebSearch",
+    ]
+    .map(String::from)
+    .to_vec();
+    spec
+}
+
+fn transcript_has_turns(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|t| t.contains(r#""type":"assistant""#))
+}
+
+/// Stages everything except the copied (untracked, machine-specific) `local.properties`.
+async fn stage_all(run: &Run) -> Result<()> {
+    shell::check("git", &["add", "-A", "--", ".", ":(exclude)local.properties"], &run.worktree).await?;
+    Ok(())
+}
+
+/// Commits the worktree state on the harness branch (if anything changed), so progress
+/// survives restarts and each step's change is visible in `git log`. Squashed at the end.
+async fn wip_commit(run: &Run, msg: &str) -> Result<()> {
+    stage_all(run).await?;
+    let staged = shell::exec("git", &["diff", "--cached", "--quiet"], &run.worktree, Duration::from_secs(60)).await?;
+    if !staged.ok {
+        shell::check("git", &["commit", "-q", "--no-verify", "-m", msg], &run.worktree).await?;
+    }
+    Ok(())
+}
+
+/// Where this branch forked from the base branch.
+async fn base_commit(run: &Run) -> Result<String> {
+    let base = &run.cfg.app.base_branch;
+    match shell::check("git", &["merge-base", "HEAD", &format!("origin/{base}")], &run.worktree).await {
+        Ok(sha) => Ok(sha),
+        Err(_) => shell::check("git", &["merge-base", "HEAD", base], &run.worktree).await,
+    }
 }
 
 /// Ad-hoc exploratory QA on whatever build is installed — no issue, no code changes.
@@ -532,4 +742,34 @@ async fn explore_inner(run: &mut Run, goal: &str) -> Result<()> {
     run.db.set_summary(run.id, &format!("QA: {verdict}"))?;
     println!("{}\n\nartifacts: {}\ncost: ${:.2}", serde_json::to_string_pretty(&qa)?, run.dir.display(), run.cost);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_roundtrip_and_retry() {
+        let mut cp = Checkpoint::new();
+        cp.step = Step::Device;
+        cp.dev_session = Some("s".into());
+        cp.retry("fix it".into());
+        let v = serde_json::to_value(&cp).unwrap();
+        assert_eq!(v["step"], "develop");
+        let back: Checkpoint = serde_json::from_value(v).unwrap();
+        assert_eq!((back.iter, back.step, back.feedback.as_deref(), back.dev_session.as_deref()), (2, Step::Develop, Some("fix it"), Some("s")));
+        // Older checkpoints without optional fields still load.
+        let old: Checkpoint = serde_json::from_value(json!({"iter": 1, "step": "gate"})).unwrap();
+        assert_eq!(old.step, Step::Gate);
+    }
+
+    #[test]
+    fn unique_path_keeps_earlier_transcripts() {
+        let dir = std::env::temp_dir().join(format!("harness-up-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(unique_path(&dir, "developer-1.jsonl"), dir.join("developer-1.jsonl"));
+        std::fs::write(dir.join("developer-1.jsonl"), "").unwrap();
+        assert_eq!(unique_path(&dir, "developer-1.jsonl"), dir.join("developer-1-r2.jsonl"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

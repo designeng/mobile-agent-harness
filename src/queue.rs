@@ -41,7 +41,7 @@ pub async fn run(cfg: Config, opts: QueueOpts) -> Result<()> {
     let repo = cfg.github.repo.clone();
     let budget = opts.budget_usd.or(cfg.queue.budget_usd);
     let db = Db::open(&cfg.state_dir())?;
-    let since = db.max_run_id()?;
+    let since = db.cost_marker()?;
     if !opts.dry_run {
         for (name, color, desc) in [
             (IN_PROGRESS, "fbca04", "Harness agents are working on this"),
@@ -66,6 +66,20 @@ pub async fn run(cfg: Config, opts: QueueOpts) -> Result<()> {
         }
 
         let all = github::list_open_issues(&repo).await?;
+        // Stopped runs (crash, reboot, environment problem) go first and continue where they
+        // stopped; a crashed one may still carry the in-progress label, so bypass the filter.
+        let open: HashSet<u64> = all.iter().filter(|i| !i.has_label(DONE) && !i.has_label(FAILED)).map(|i| i.number).collect();
+        let resumable = db.resumable_issues()?.into_iter().find(|n| open.contains(n) && !skipped.contains(n));
+        if let Some(n) = resumable.filter(|_| !opts.dry_run) {
+            started += 1;
+            match run_one(&cfg, &db, n, opts.pr, "resuming a stopped run", &mut report, &mut fails_in_row).await? {
+                Some(stop) => break stop,
+                None => continue,
+            }
+        }
+        if let Some(n) = resumable.filter(|_| opts.dry_run) {
+            println!("Resume first: #{n} (stopped run)");
+        }
         let cands = candidates(&all, &cfg.queue.label, &skipped);
         if cands.is_empty() {
             break "no eligible issues left".into();
@@ -98,40 +112,9 @@ pub async fn run(cfg: Config, opts: QueueOpts) -> Result<()> {
             break "picker skipped every candidate".into();
         };
 
-        tracing::info!(issue = next, "queue: next issue — {why}");
-        github::edit_labels(&repo, next, &[IN_PROGRESS], &[]).await?;
         started += 1;
-        let before = db.max_run_id()?;
-        let res = pipeline::run_issue(cfg.clone(), next, opts.pr).await;
-        let cost = db.cost_since(before)?;
-        match res {
-            Ok(()) => {
-                fails_in_row = 0;
-                github::edit_labels(&repo, next, &[DONE], &[IN_PROGRESS]).await?;
-                report.push(format!("#{next} done (${cost:.2})"));
-            }
-            Err(e) if e.downcast_ref::<EnvError>().is_some() => {
-                // Not the issue's fault: give it back to the queue and stop.
-                github::edit_labels(&repo, next, &[], &[IN_PROGRESS]).await?;
-                report.push(format!("#{next} interrupted by environment (${cost:.2})"));
-                break format!("environment problem: {e:#}");
-            }
-            Err(e) => {
-                fails_in_row += 1;
-                github::edit_labels(&repo, next, &[FAILED], &[IN_PROGRESS]).await?;
-                let msg = format!(
-                    "Harness could not finish this issue (cost ${cost:.2}).\n\n```\n{}\n```\n\n\
-                     Clarify the issue and remove the `{FAILED}` label to let the queue retry it.",
-                    truncate(&format!("{e:#}"), 3000)
-                );
-                if let Err(ce) = github::comment(&repo, next, &msg).await {
-                    tracing::warn!("commenting on #{next}: {ce:#}");
-                }
-                report.push(format!("#{next} failed (${cost:.2})"));
-                if fails_in_row >= cfg.queue.max_consecutive_failures {
-                    break format!("{fails_in_row} failures in a row");
-                }
-            }
+        if let Some(stop) = run_one(&cfg, &db, next, opts.pr, &why, &mut report, &mut fails_in_row).await? {
+            break stop;
         }
     };
 
@@ -141,6 +124,46 @@ pub async fn run(cfg: Config, opts: QueueOpts) -> Result<()> {
     }
     println!("total cost: ${:.2}", db.cost_since(since)?);
     Ok(())
+}
+
+/// Runs (or resumes) one issue and labels it by the outcome. `Some(reason)` = stop the queue.
+async fn run_one(cfg: &Config, db: &Db, next: u64, pr: bool, why: &str, report: &mut Vec<String>, fails_in_row: &mut u32) -> Result<Option<String>> {
+    let repo = &cfg.github.repo;
+    tracing::info!(issue = next, "queue: next issue — {why}");
+    github::edit_labels(repo, next, &[IN_PROGRESS], &[]).await?;
+    let before = db.cost_marker()?;
+    let res = pipeline::run_issue(cfg.clone(), next, pr, false).await;
+    let cost = db.cost_since(before)?;
+    match res {
+        Ok(()) => {
+            *fails_in_row = 0;
+            github::edit_labels(repo, next, &[DONE], &[IN_PROGRESS]).await?;
+            report.push(format!("#{next} done (${cost:.2})"));
+        }
+        Err(e) if e.downcast_ref::<EnvError>().is_some() => {
+            // Not the issue's fault: the run stays resumable; give the issue back and stop.
+            github::edit_labels(repo, next, &[], &[IN_PROGRESS]).await?;
+            report.push(format!("#{next} paused by environment (${cost:.2}); the next queue/run continues it"));
+            return Ok(Some(format!("environment problem: {e:#}")));
+        }
+        Err(e) => {
+            *fails_in_row += 1;
+            github::edit_labels(repo, next, &[FAILED], &[IN_PROGRESS]).await?;
+            let msg = format!(
+                "Harness could not finish this issue (cost ${cost:.2}).\n\n```\n{}\n```\n\n\
+                 Clarify the issue and remove the `{FAILED}` label to let the queue retry it.",
+                truncate(&format!("{e:#}"), 3000)
+            );
+            if let Err(ce) = github::comment(repo, next, &msg).await {
+                tracing::warn!("commenting on #{next}: {ce:#}");
+            }
+            report.push(format!("#{next} failed (${cost:.2})"));
+            if *fails_in_row >= cfg.queue.max_consecutive_failures {
+                return Ok(Some(format!("{fails_in_row} failures in a row")));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Eligible issues: ready label, no status/blocked label, no open dependencies, not skipped earlier.

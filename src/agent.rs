@@ -18,6 +18,14 @@ pub struct AgentSpec {
     pub mcp_config: Option<PathBuf>,
     pub add_dirs: Vec<PathBuf>,
     pub json_schema: Option<Value>,
+    /// Keep the Claude session on disk so it can be resumed later (developer only:
+    /// other roles start fresh every time and would just clutter the session store).
+    pub persist_session: bool,
+    /// Session id for a new persisted session; assigned up front so it is known
+    /// (and recorded) even if the process is killed mid-way.
+    pub session_id: Option<String>,
+    /// Continue this earlier session instead of starting a new one; `prompt` is the next user turn.
+    pub resume: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -32,6 +40,7 @@ pub struct AgentResult {
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
+    pub session_id: Option<String>,
     /// Set when the session ended with `is_error`; cost and usage are still filled in.
     pub error: Option<String>,
 }
@@ -49,6 +58,9 @@ impl AgentSpec {
             mcp_config: None,
             add_dirs: vec![],
             json_schema: None,
+            persist_session: false,
+            session_id: None,
+            resume: None,
         }
     }
 }
@@ -63,13 +75,24 @@ pub async fn run(spec: AgentSpec, log: &Path) -> Result<AgentResult> {
         // Ignore the user's global plugins/hooks: roles must be reproducible.
         .args(["--setting-sources", "project"])
         .arg("--strict-mcp-config")
-        .arg("--no-session-persistence")
         .args(["--append-system-prompt", &spec.system])
         .current_dir(&spec.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if !spec.persist_session {
+        cmd.arg("--no-session-persistence");
+    }
+    match (&spec.resume, &spec.session_id) {
+        (Some(id), _) => {
+            cmd.args(["--resume", id]);
+        }
+        (None, Some(id)) => {
+            cmd.args(["--session-id", id]);
+        }
+        _ => {}
+    }
     if let Some(m) = &spec.model {
         cmd.args(["--model", m]);
     }
@@ -100,12 +123,16 @@ pub async fn run(spec: AgentSpec, log: &Path) -> Result<AgentResult> {
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let mut result: Option<Value> = None;
     let mut model: Option<String> = None;
+    let mut session_id: Option<String> = None;
     while let Some(line) = lines.next_line().await? {
         log_file.write_all(line.as_bytes()).await?;
         log_file.write_all(b"\n").await?;
         let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
         match v["type"].as_str() {
-            Some("system") if v["subtype"] == "init" => model = v["model"].as_str().map(String::from),
+            Some("system") if v["subtype"] == "init" => {
+                model = v["model"].as_str().map(String::from);
+                session_id = v["session_id"].as_str().map(String::from);
+            }
             Some("assistant") => log_progress(spec.role, &v),
             Some("result") => result = Some(v),
             _ => {}
@@ -134,6 +161,7 @@ pub async fn run(spec: AgentSpec, log: &Path) -> Result<AgentResult> {
         structured: res.get("structured_output").filter(|v| !v.is_null()).cloned(),
         cost_usd: cost,
         model: model.or(spec.model),
+        session_id: res["session_id"].as_str().map(String::from).or(session_id),
         duration_ms: res["duration_ms"].as_i64(),
         num_turns: res["num_turns"].as_i64(),
         input_tokens: usage["input_tokens"].as_i64(),
@@ -153,5 +181,28 @@ fn log_progress(role: &str, v: &Value) {
             let short: String = input.chars().take(120).collect();
             tracing::info!(role, "→ {name} {short}");
         }
+    }
+}
+
+/// Random UUID v4 for `--session-id` (no uuid crate needed for one call per agent).
+pub fn new_session_id() -> Result<String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32]))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn session_id_is_uuid_v4() {
+        let id = super::new_session_id().unwrap();
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+        assert!(parts[2].starts_with('4'));
+        assert_ne!(id, super::new_session_id().unwrap());
     }
 }

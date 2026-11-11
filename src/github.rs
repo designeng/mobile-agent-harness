@@ -45,8 +45,14 @@ pub async fn fetch_issue(repo: &str, number: u64) -> Result<Issue> {
 }
 
 /// Push the branch and open a draft PR. Returns the PR URL.
+/// Idempotent, so a resumed run can repeat it: the branch is force-pushed (it is
+/// harness-owned and squashed before this), an already open PR is reused.
 pub async fn open_pr(worktree: &Path, repo: &str, base: &str, branch: &str, title: &str, body: &str) -> Result<String> {
-    shell::check("git", &["push", "-u", "origin", branch], worktree).await?;
+    shell::check("git", &["push", "--force-with-lease", "-u", "origin", branch], worktree).await?;
+    let existing = shell::check("gh", &["pr", "view", branch, "-R", repo, "--json", "url,state", "-q", "select(.state == \"OPEN\") | .url"], worktree).await;
+    if let Some(url) = existing.ok().map(|u| u.trim().to_string()).filter(|u| !u.is_empty()) {
+        return Ok(url);
+    }
     shell::check(
         "gh",
         &["pr", "create", "-R", repo, "--draft", "--base", base, "--head", branch, "--title", title, "--body", body],
