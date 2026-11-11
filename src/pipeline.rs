@@ -350,6 +350,8 @@ async fn issue_inner(run: &mut Run, issue_no: u64, open_pr: bool) -> Result<()> 
     let adb = Adb::resolve(&run.cfg.device.adb, run.cfg.device.serial.as_deref())
         .await
         .map_err(|e| EnvError(format!("device: {e:#}")))?;
+    // Fail before planning/building (minutes + $) if the device will reject the APK anyway.
+    adb.check_usb_install_allowed().await.map_err(|e| EnvError(format!("device: {e:#}")))?;
 
     let contract = format!(
         "\n# Build contract (the harness enforces this)\n- Build: `{}` (run from the repo root)\n- APK expected at: `{}`\n- Unit tests: `{}`\n- Must run on a real device WITHOUT a dev server (JS bundle embedded in the APK).\n",

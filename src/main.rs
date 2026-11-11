@@ -152,6 +152,7 @@ async fn doctor(config: &Path) -> Result<()> {
             let model = d.prop("ro.product.model").await.unwrap_or_default();
             let ver = d.prop("ro.build.version.release").await.unwrap_or_default();
             check("device", Ok(format!("{} ({model}, Android {ver})", d.serial)));
+            check("usb install", d.check_usb_install_allowed().await.map(|_| "allowed".into()));
             let lp = d.run(&["shell", "pm", "list", "packages", "dev.mobile.maestro"]).await.map(|o| o.stdout).unwrap_or_default();
             check(
                 "maestro driver on device",

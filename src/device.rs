@@ -54,14 +54,36 @@ impl Adb {
     /// user confirms on the phone, up to `wait`.
     pub async fn install_confirmed(&self, apk: &Path, wait: Duration) -> Result<Out> {
         let deadline = std::time::Instant::now() + wait;
+        let mut warned = false;
         loop {
             let o = self.install(apk).await?;
             let restricted = o.tail(4000).contains("INSTALL_FAILED_USER_RESTRICTED");
             if o.ok || !restricted || std::time::Instant::now() >= deadline {
                 return Ok(o);
             }
-            tracing::warn!("install needs confirmation: tap «Install» in the dialog on the phone");
+            if !warned {
+                tracing::warn!("install needs confirmation: tap «Install» in the dialog on the phone (retrying for {}s)", wait.as_secs());
+                warned = true;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
+    }
+
+    /// Xiaomi/Redmi/POCO (MIUI/HyperOS) reject every `adb install` unless
+    /// Developer options → "Install via USB" is on (`persist.security.adbinstall=1`).
+    /// Returns an actionable error on such devices when it is off; Ok elsewhere.
+    pub async fn check_usb_install_allowed(&self) -> Result<()> {
+        let maker = self.prop("ro.product.manufacturer").await?.to_lowercase();
+        if !["xiaomi", "redmi", "poco"].iter().any(|m| maker.contains(m)) {
+            return Ok(());
+        }
+        if self.prop("persist.security.adbinstall").await? != "1" {
+            bail!(
+                "\"Install via USB\" is off on this {maker} device: enable Developer options → \"Install via USB\" \
+                 (and \"USB debugging (Security settings)\"), otherwise installs fail with INSTALL_FAILED_USER_RESTRICTED"
+            );
+        }
+        Ok(())
     }
 
     pub async fn launch(&self, pkg: &str) -> Result<Out> {
